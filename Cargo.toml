@@ -1,0 +1,31 @@
+[package]
+name = "mquickjs-rs"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny, safe, no_std JavaScript engine for microcontrollers"
+license = "MIT"
+
+[lib]
+name = "mquickjs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mqjs"
+path = "src/bin/mqjs.rs"
+required-features = ["std"]
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+
+[dependencies]
+libm = "0.2"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Link-time optimization
+codegen-units = 1   # Better optimization
+panic = "abort"     # Smaller binary
