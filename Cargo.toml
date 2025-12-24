@@ -1,17 +1,19 @@
 [package]
-name = "mquickjs-rs"
+name = "kryhta"
 version = "0.1.0"
 edition = "2021"
 description = "A tiny, safe, no_std JavaScript engine for microcontrollers"
 license = "MIT"
+keywords = ["javascript", "embedded", "no_std", "interpreter"]
+categories = ["embedded", "no-std", "parser-implementations"]
 
 [lib]
-name = "mquickjs"
+name = "kryhta"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mqjs"
-path = "src/bin/mqjs.rs"
+name = "kryhta"
+path = "src/bin/kryhta.rs"
 required-features = ["std"]
 
 [features]
@@ -25,7 +27,7 @@ libm = "0.2"
 [dev-dependencies]
 
 [profile.release]
-opt-level = "z"     # Optimize for size
-lto = true          # Link-time optimization
-codegen-units = 1   # Better optimization
-panic = "abort"     # Smaller binary
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
