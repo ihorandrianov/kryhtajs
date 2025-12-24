@@ -1,4 +1,6 @@
-//! MQuickJS-RS: A tiny, safe, no_std JavaScript engine
+//! KryhtaJS: A tiny, safe, no_std JavaScript engine
+//!
+//! крихта (kryhta) — Ukrainian for "crumb"
 
 #![no_std]
 
