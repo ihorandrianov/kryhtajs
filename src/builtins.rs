@@ -1,103 +1,81 @@
-//! Built-in JavaScript functions
+//! Built-in JavaScript functions for CEKH machine
+//!
+//! Native functions are implemented via the NativeFn enum.
+//! The call_native function dispatches to the appropriate implementation.
 
-use crate::error::Result;
+use crate::object::NativeFn;
+use crate::string_pool::StringPool;
 use crate::value::JSValue;
-use crate::vm::VM;
 
-pub type NativeFn = fn(&mut VM, &[JSValue]) -> Result<JSValue>;
-
-pub fn math_floor(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    let n = to_number(args.first().copied().unwrap_or(JSValue::Undefined));
-    Ok(JSValue::Float(libm::floor(n)))
-}
-
-pub fn math_ceil(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    let n = to_number(args.first().copied().unwrap_or(JSValue::Undefined));
-    Ok(JSValue::Float(libm::ceil(n)))
-}
-
-pub fn math_round(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    let n = to_number(args.first().copied().unwrap_or(JSValue::Undefined));
-    Ok(JSValue::Float(libm::round(n)))
-}
-
-pub fn math_abs(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    let n = to_number(args.first().copied().unwrap_or(JSValue::Undefined));
-    Ok(JSValue::Float(libm::fabs(n)))
-}
-
-pub fn math_sqrt(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    let n = to_number(args.first().copied().unwrap_or(JSValue::Undefined));
-    Ok(JSValue::Float(libm::sqrt(n)))
-}
-
-pub fn math_pow(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    let base = to_number(args.first().copied().unwrap_or(JSValue::Undefined));
-    let exp = to_number(args.get(1).copied().unwrap_or(JSValue::Undefined));
-    Ok(JSValue::Float(libm::pow(base, exp)))
-}
-
-pub fn math_sin(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    let n = to_number(args.first().copied().unwrap_or(JSValue::Undefined));
-    Ok(JSValue::Float(libm::sin(n)))
-}
-
-pub fn math_cos(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    let n = to_number(args.first().copied().unwrap_or(JSValue::Undefined));
-    Ok(JSValue::Float(libm::cos(n)))
-}
-
-pub fn math_tan(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    let n = to_number(args.first().copied().unwrap_or(JSValue::Undefined));
-    Ok(JSValue::Float(libm::tan(n)))
-}
-
-pub fn math_log(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    let n = to_number(args.first().copied().unwrap_or(JSValue::Undefined));
-    Ok(JSValue::Float(libm::log(n)))
-}
-
-pub fn math_exp(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    let n = to_number(args.first().copied().unwrap_or(JSValue::Undefined));
-    Ok(JSValue::Float(libm::exp(n)))
-}
-
-pub fn math_min(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    if args.is_empty() {
-        return Ok(JSValue::Float(f64::INFINITY));
-    }
-    let mut min = to_number(args[0]);
-    for arg in &args[1..] {
-        let n = to_number(*arg);
-        if n < min || n.is_nan() {
-            min = n;
-        }
-    }
-    Ok(JSValue::Float(min))
-}
-
-pub fn math_max(_vm: &mut VM, args: &[JSValue]) -> Result<JSValue> {
-    if args.is_empty() {
-        return Ok(JSValue::Float(f64::NEG_INFINITY));
-    }
-    let mut max = to_number(args[0]);
-    for arg in &args[1..] {
-        let n = to_number(*arg);
-        if n > max || n.is_nan() {
-            max = n;
-        }
-    }
-    Ok(JSValue::Float(max))
-}
-
-fn to_number(value: JSValue) -> f64 {
-    match value {
+/// Helper to convert JSValue to f64
+fn to_number(val: JSValue, _strings: &StringPool) -> f64 {
+    match val {
         JSValue::Undefined => f64::NAN,
         JSValue::Null => 0.0,
-        JSValue::Bool(b) => if b { 1.0 } else { 0.0 },
+        JSValue::Bool(true) => 1.0,
+        JSValue::Bool(false) => 0.0,
         JSValue::Int(n) => n as f64,
         JSValue::Float(f) => f,
-        JSValue::String(_) => f64::NAN,
-        JSValue::Object(_) | JSValue::Array(_) | JSValue::Function(_) => f64::NAN,
+        JSValue::String(_) => f64::NAN, // Simplified - full impl would parse
+        _ => f64::NAN,
+    }
+}
+
+/// Helper to return a numeric result (Int or Float)
+fn num_result(n: f64) -> JSValue {
+    if n.fract() == 0.0 && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
+        JSValue::Int(n as i32)
+    } else {
+        JSValue::Float(n)
+    }
+}
+
+/// Call a native function with up to 2 arguments
+pub fn call_native(
+    native_fn: &NativeFn,
+    arg0: JSValue,
+    arg1: JSValue,
+    strings: &StringPool,
+) -> JSValue {
+    let n0 = to_number(arg0, strings);
+    let n1 = to_number(arg1, strings);
+
+    match native_fn {
+        NativeFn::MathFloor => num_result(n0.floor()),
+        NativeFn::MathCeil => num_result(n0.ceil()),
+        NativeFn::MathRound => num_result((n0 + 0.5).floor()),
+        NativeFn::MathAbs => num_result(n0.abs()),
+        NativeFn::MathSqrt => num_result(n0.sqrt()),
+        NativeFn::MathPow => num_result(n0.powf(n1)),
+        NativeFn::MathMin => {
+            if n0.is_nan() || n1.is_nan() {
+                JSValue::Float(f64::NAN)
+            } else {
+                num_result(n0.min(n1))
+            }
+        }
+        NativeFn::MathMax => {
+            if n0.is_nan() || n1.is_nan() {
+                JSValue::Float(f64::NAN)
+            } else {
+                num_result(n0.max(n1))
+            }
+        }
+        NativeFn::MathSin => num_result(n0.sin()),
+        NativeFn::MathCos => num_result(n0.cos()),
+        NativeFn::MathLog => num_result(n0.ln()),
+        NativeFn::MathExp => num_result(n0.exp()),
+        NativeFn::MathTrunc => num_result(n0.trunc()),
+        NativeFn::MathSign => {
+            if n0.is_nan() {
+                JSValue::Float(f64::NAN)
+            } else if n0 == 0.0 {
+                JSValue::Int(0)
+            } else if n0 > 0.0 {
+                JSValue::Int(1)
+            } else {
+                JSValue::Int(-1)
+            }
+        }
     }
 }

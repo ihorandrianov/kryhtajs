@@ -1,9 +1,9 @@
 //! KryhtaJS REPL and CLI
+//!
+//! Uses CEKH machine for direct AST interpretation.
 
-use kryhta::{JSValue, Result, VM, JSError};
-use kryhta::{ArenaParser, ArenaCompiler, AstArena};
-use kryhta::fixed_string::FixedStringPool;
-use kryhta::{MAX_STRING_BYTES, MAX_STRINGS};
+use kryhta::parser::Parser;
+use kryhta::{JSError, JSValue, Result, CEKH};
 
 use std::io::{self, BufRead, Write};
 
@@ -22,11 +22,11 @@ fn main() -> Result<()> {
 }
 
 fn repl() -> Result<()> {
-    println!("KryhtaJS v0.1.0 — крихта");
+    println!("KryhtaJS v0.2.0 — крихта (CEKH)");
     println!("Type 'exit' or Ctrl+D to quit\n");
 
     let stdin = io::stdin();
-    let mut vm = Box::new(VM::default());
+    let mut machine = CEKH::new();
 
     loop {
         print!("> ");
@@ -37,11 +37,17 @@ fn repl() -> Result<()> {
             Ok(0) => break,
             Ok(_) => {
                 let line = line.trim();
-                if line == "exit" { break; }
-                if line.is_empty() { continue; }
+                if line == "exit" {
+                    break;
+                }
+                if line.is_empty() {
+                    continue;
+                }
 
-                match eval_line(&mut *vm, line) {
-                    Ok(result) => println!("{:?}", result),
+                match eval_line(&mut machine, line) {
+                    Ok(result) => {
+                        print_value(&result, &machine);
+                    }
                     Err(e) => eprintln!("Error: {}", e),
                 }
             }
@@ -56,25 +62,24 @@ fn repl() -> Result<()> {
     Ok(())
 }
 
-fn eval_line(vm: &mut VM, source: &str) -> Result<JSValue> {
-    let mut strings: FixedStringPool<MAX_STRING_BYTES, MAX_STRINGS> = FixedStringPool::default();
-    let mut ast = AstArena::new();
+fn eval_line(machine: &mut CEKH, source: &str) -> Result<JSValue> {
+    // Parse source to AST using machine's string pool
+    // This ensures StrIds in AST match machine's pool
+    let strings = std::mem::take(&mut machine.strings);
+    let parser = Parser::with_strings(source, strings)?;
+    let (arena, strings) = parser.parse_program()?;
+    machine.strings = strings;
 
-    let mut parser = ArenaParser::new(source, &mut strings, &mut ast)?;
-    parser.parse_program()?;
-
-    let compiler = ArenaCompiler::new(&strings, &ast);
-    let chunk = compiler.compile()?;
-
-    vm.run(chunk)
+    // Run directly on AST
+    machine.run(&arena)
 }
 
 fn run(source: &str) -> Result<()> {
-    let mut vm = Box::new(VM::default());
-    match eval_line(&mut *vm, source) {
+    let mut machine = CEKH::new();
+    match eval_line(&mut machine, source) {
         Ok(result) => {
             if !matches!(result, JSValue::Undefined) {
-                println!("{:?}", result);
+                print_value(&result, &machine);
             }
         }
         Err(e) => {
@@ -83,4 +88,85 @@ fn run(source: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_value(val: &JSValue, machine: &CEKH) {
+    match val {
+        JSValue::Undefined => println!("undefined"),
+        JSValue::Null => println!("null"),
+        JSValue::Bool(b) => println!("{}", b),
+        JSValue::Int(n) => println!("{}", n),
+        JSValue::Float(f) => {
+            if f.is_nan() {
+                println!("NaN");
+            } else if f.is_infinite() {
+                if *f > 0.0 {
+                    println!("Infinity");
+                } else {
+                    println!("-Infinity");
+                }
+            } else if f.fract() == 0.0 {
+                println!("{}", *f as i64);
+            } else {
+                println!("{}", f);
+            }
+        }
+        JSValue::String(str_id) => {
+            if let Some(s) = machine.strings.get(*str_id) {
+                println!("'{}'", s);
+            } else {
+                println!("<invalid string>");
+            }
+        }
+        JSValue::Object(_) => println!("[object Object]"),
+        JSValue::Array(id) => {
+            if let Some(obj) = machine.objects.get(id.into_arena_id()) {
+                if let Some(arr) = obj.as_array() {
+                    let parts: Vec<String> = arr
+                        .elements
+                        .iter()
+                        .map(|v| format_value(v, machine))
+                        .collect();
+                    println!("[{}]", parts.join(", "));
+                } else {
+                    println!("[object Array]");
+                }
+            } else {
+                println!("[object Array]");
+            }
+        }
+        JSValue::Function(_) => println!("[Function]"),
+    }
+}
+
+fn format_value(val: &JSValue, machine: &CEKH) -> String {
+    match val {
+        JSValue::Undefined => "undefined".to_string(),
+        JSValue::Null => "null".to_string(),
+        JSValue::Bool(b) => b.to_string(),
+        JSValue::Int(n) => n.to_string(),
+        JSValue::Float(f) => {
+            if f.is_nan() {
+                "NaN".to_string()
+            } else if f.is_infinite() {
+                if *f > 0.0 {
+                    "Infinity".to_string()
+                } else {
+                    "-Infinity".to_string()
+                }
+            } else {
+                f.to_string()
+            }
+        }
+        JSValue::String(str_id) => {
+            if let Some(s) = machine.strings.get(*str_id) {
+                format!("'{}'", s)
+            } else {
+                "<invalid>".to_string()
+            }
+        }
+        JSValue::Object(_) => "[object Object]".to_string(),
+        JSValue::Array(_) => "[Array]".to_string(),
+        JSValue::Function(_) => "[Function]".to_string(),
+    }
 }

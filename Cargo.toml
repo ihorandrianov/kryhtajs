@@ -1,11 +1,11 @@
 [package]
 name = "kryhta"
 version = "0.1.0"
-edition = "2021"
-description = "A tiny, safe, no_std JavaScript engine for microcontrollers"
+edition = "2024"
+description = "A tiny JavaScript engine with algebraic effects"
 license = "MIT"
-keywords = ["javascript", "embedded", "no_std", "interpreter"]
-categories = ["embedded", "no-std", "parser-implementations"]
+keywords = ["javascript", "interpreter", "effects"]
+categories = ["parser-implementations"]
 
 [lib]
 name = "kryhta"
@@ -14,20 +14,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "kryhta"
 path = "src/bin/kryhta.rs"
-required-features = ["std"]
-
-[features]
-default = ["std"]
-std = ["alloc"]
-alloc = []
 
 [dependencies]
-libm = "0.2"
 
 [dev-dependencies]
 
 [profile.release]
-opt-level = "z"
+opt-level = 2
 lto = true
 codegen-units = 1
-panic = "abort"

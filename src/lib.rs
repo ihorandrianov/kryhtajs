@@ -1,46 +1,32 @@
-//! KryhtaJS: A tiny, safe, no_std JavaScript engine
+//! KryhtaJS: A tiny JavaScript engine with algebraic effects
 //!
 //! крихта (kryhta) — Ukrainian for "crumb"
+//!
+//! This engine uses a CEKH machine (Control, Environment, Kontinuation, Handlers)
+//! for evaluation. The H component provides infrastructure for algebraic effects.
 
-#![no_std]
-
-#[cfg(feature = "alloc")]
-extern crate alloc;
-
-pub mod bytecode;
-pub mod error;
-pub mod fixed_collections;
-pub mod fixed_string;
-pub mod object;
-pub mod pool;
-pub mod value;
+pub mod arena;
 pub mod ast;
-pub mod lexer;
-pub mod parser_arena;
-pub mod compiler_arena;
-
-#[cfg(feature = "alloc")]
-pub mod compiler;
-#[cfg(feature = "alloc")]
-pub mod parser;
-
 pub mod builtins;
+pub mod cekh;
+pub mod cont;
+pub mod env;
+pub mod error;
 pub mod gc;
-pub mod vm;
+pub mod handler;
+pub mod lexer;
+pub mod object;
+pub mod parser;
+pub mod string_pool;
+pub mod value;
 
+// Re-exports
+pub use arena::{Arena, ArenaId};
+pub use ast::{AstArena, Expr, ExprId, Stmt, StmtId};
+pub use cekh::{Control, CEKH};
+pub use cont::{ContArena, ContId, Kont};
+pub use env::{Env, EnvArena, EnvId};
 pub use error::{JSError, Result};
-pub use fixed_string::StrId;
+pub use handler::{Handler, HandlerArena, HandlerId};
+pub use string_pool::{StrId, StringPool};
 pub use value::{JSValue, ObjId};
-pub use vm::VM;
-pub use ast::{AstArena, ExprId, StmtId};
-pub use parser_arena::Parser as ArenaParser;
-pub use compiler_arena::Compiler as ArenaCompiler;
-
-pub const MAX_OBJECTS: usize = 512;
-pub const MAX_STRING_BYTES: usize = 4096;
-pub const MAX_STRINGS: usize = 256;
-pub const MAX_STACK: usize = 256;
-pub const MAX_CALL_DEPTH: usize = 32;
-pub const MAX_GLOBALS: usize = 64;
-pub const MAX_BYTECODE: usize = 8192;
-pub const MAX_CONSTANTS: usize = 256;

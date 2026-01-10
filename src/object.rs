@@ -1,17 +1,24 @@
 //! JavaScript object representation
 
-use crate::fixed_collections::{FixedMap, FixedVec};
-use crate::fixed_string::StrId;
+use std::collections::HashMap;
+
+use crate::ast::{ExprId, StmtId};
+use crate::env::EnvId;
+use crate::string_pool::StrId;
 use crate::value::{JSValue, ObjId};
 
-pub const MAX_PROPERTIES: usize = 32;
-pub const MAX_ARRAY_ELEMENTS: usize = 32;
-pub const MAX_CAPTURES: usize = 16;
-
 pub struct Object {
-    pub properties: FixedMap<StrId, Property, MAX_PROPERTIES>,
+    pub properties: HashMap<StrId, Property>,
     pub prototype: Option<ObjId>,
     pub kind: ObjectKind,
+    pub ownership: Ownership,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ownership {
+    Unique,
+    Shared(usize),
+    Moved,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -24,11 +31,41 @@ pub struct Property {
 
 impl Property {
     pub fn value(val: JSValue) -> Self {
-        Self { value: val, writable: true, enumerable: true, configurable: true }
+        Self {
+            value: val,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        }
     }
+
     pub fn readonly(val: JSValue) -> Self {
-        Self { value: val, writable: false, enumerable: true, configurable: false }
+        Self {
+            value: val,
+            writable: false,
+            enumerable: true,
+            configurable: false,
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NativeFn {
+    MathFloor,
+    MathCeil,
+    MathRound,
+    MathAbs,
+    MathSqrt,
+    MathPow,
+    MathMin,
+    MathMax,
+    MathSin,
+    MathCos,
+    MathLog,
+    MathExp,
+    MathTrunc,
+    MathSign,
 }
 
 #[derive(Clone)]
@@ -37,27 +74,83 @@ pub enum ObjectKind {
     Array(ArrayData),
     Function(FunctionData),
     BoundFunction(BoundFunctionData),
+    NativeFunction(NativeFn),
 }
 
-impl Default for ObjectKind { fn default() -> Self { ObjectKind::Ordinary } }
+impl Default for ObjectKind {
+    fn default() -> Self {
+        ObjectKind::Ordinary
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct ArrayData {
-    pub elements: FixedVec<JSValue, MAX_ARRAY_ELEMENTS>,
+    pub elements: Vec<JSValue>,
 }
 
+/// Function data for CEKH machine (AST-based closures)
 #[derive(Clone)]
 pub struct FunctionData {
-    pub code_offset: u32,
-    pub param_count: u8,
-    pub local_count: u8,
-    pub captures: FixedVec<JSValue, MAX_CAPTURES>,
+    /// Start index into AstArena.param_lists
+    pub params_start: u32,
+    /// Number of parameters
+    pub params_count: u16,
+    /// Function body (statement)
+    pub body: StmtId,
+    /// For arrow functions with expression body (implicit return)
+    pub expr_body: Option<ExprId>,
+    /// Captured environment (closure!)
+    pub env: EnvId,
+    /// Function name (for named functions)
     pub name: Option<StrId>,
 }
 
-impl Default for FunctionData {
-    fn default() -> Self {
-        Self { code_offset: 0, param_count: 0, local_count: 0, captures: FixedVec::new(), name: None }
+impl FunctionData {
+    /// Create a new function (regular function declaration/expression)
+    pub fn new(
+        params_start: u32,
+        params_count: u16,
+        body: StmtId,
+        env: EnvId,
+        name: Option<StrId>,
+    ) -> Self {
+        Self {
+            params_start,
+            params_count,
+            body,
+            expr_body: None,
+            env,
+            name,
+        }
+    }
+
+    /// Create an arrow function with expression body
+    pub fn arrow_expr(
+        params_start: u32,
+        params_count: u16,
+        expr_body: ExprId,
+        env: EnvId,
+    ) -> Self {
+        Self {
+            params_start,
+            params_count,
+            body: StmtId::NONE,
+            expr_body: Some(expr_body),
+            env,
+            name: None,
+        }
+    }
+
+    /// Create an arrow function with block body
+    pub fn arrow_block(params_start: u32, params_count: u16, body: StmtId, env: EnvId) -> Self {
+        Self {
+            params_start,
+            params_count,
+            body,
+            expr_body: None,
+            env,
+            name: None,
+        }
     }
 }
 
@@ -65,48 +158,104 @@ impl Default for FunctionData {
 pub struct BoundFunctionData {
     pub target: ObjId,
     pub this_arg: JSValue,
-    pub bound_args: FixedVec<JSValue, 8>,
+    pub bound_args: Vec<JSValue>,
 }
 
 impl Object {
     pub fn new() -> Self {
-        Self { properties: FixedMap::new(), prototype: None, kind: ObjectKind::Ordinary }
-    }
-
-    pub fn array() -> Self {
-        Self { properties: FixedMap::new(), prototype: None, kind: ObjectKind::Array(ArrayData::default()) }
-    }
-
-    pub fn function(code_offset: u32, param_count: u8, name: Option<StrId>) -> Self {
         Self {
-            properties: FixedMap::new(),
+            properties: HashMap::new(),
             prototype: None,
-            kind: ObjectKind::Function(FunctionData {
-                code_offset, param_count, local_count: 0, captures: FixedVec::new(), name,
-            }),
+            kind: ObjectKind::Ordinary,
+            ownership: Ownership::Shared(1),
         }
     }
 
-    pub fn get(&self, key: StrId) -> Option<JSValue> { self.properties.get(&key).map(|p| p.value) }
-    pub fn set(&mut self, key: StrId, value: JSValue) -> bool { self.properties.insert(key, Property::value(value)) }
-    pub fn is_array(&self) -> bool { matches!(self.kind, ObjectKind::Array(_)) }
-    pub fn is_function(&self) -> bool { matches!(self.kind, ObjectKind::Function(_)) }
+    pub fn array() -> Self {
+        Self {
+            properties: HashMap::new(),
+            prototype: None,
+            kind: ObjectKind::Array(ArrayData::default()),
+            ownership: Ownership::Shared(1),
+        }
+    }
+
+    /// Create a closure (function with captured environment)
+    pub fn closure(func_data: FunctionData) -> Self {
+        Self {
+            properties: HashMap::new(),
+            prototype: None,
+            kind: ObjectKind::Function(func_data),
+            ownership: Ownership::Shared(1),
+        }
+    }
+
+    /// Create a closure with custom ownership
+    pub fn closure_with_ownership(func_data: FunctionData, ownership: Ownership) -> Self {
+        Self {
+            properties: HashMap::new(),
+            prototype: None,
+            kind: ObjectKind::Function(func_data),
+            ownership,
+        }
+    }
+
+    pub fn native_function(native_fn: NativeFn) -> Self {
+        Self {
+            properties: HashMap::new(),
+            prototype: None,
+            kind: ObjectKind::NativeFunction(native_fn),
+            ownership: Ownership::Shared(1),
+        }
+    }
+
+    pub fn get(&self, key: StrId) -> Option<JSValue> {
+        self.properties.get(&key).map(|p| p.value)
+    }
+
+    pub fn set(&mut self, key: StrId, value: JSValue) {
+        self.properties.insert(key, Property::value(value));
+    }
+
+    pub fn is_array(&self) -> bool {
+        matches!(self.kind, ObjectKind::Array(_))
+    }
+
+    pub fn is_function(&self) -> bool {
+        matches!(self.kind, ObjectKind::Function(_))
+    }
 
     pub fn as_array(&self) -> Option<&ArrayData> {
-        match &self.kind { ObjectKind::Array(data) => Some(data), _ => None }
+        match &self.kind {
+            ObjectKind::Array(data) => Some(data),
+            _ => None,
+        }
     }
 
     pub fn as_array_mut(&mut self) -> Option<&mut ArrayData> {
-        match &mut self.kind { ObjectKind::Array(data) => Some(data), _ => None }
+        match &mut self.kind {
+            ObjectKind::Array(data) => Some(data),
+            _ => None,
+        }
     }
 
     pub fn as_function(&self) -> Option<&FunctionData> {
-        match &self.kind { ObjectKind::Function(data) => Some(data), _ => None }
+        match &self.kind {
+            ObjectKind::Function(data) => Some(data),
+            _ => None,
+        }
     }
 
     pub fn as_function_mut(&mut self) -> Option<&mut FunctionData> {
-        match &mut self.kind { ObjectKind::Function(data) => Some(data), _ => None }
+        match &mut self.kind {
+            ObjectKind::Function(data) => Some(data),
+            _ => None,
+        }
     }
 }
 
-impl Default for Object { fn default() -> Self { Self::new() } }
+impl Default for Object {
+    fn default() -> Self {
+        Self::new()
+    }
+}
