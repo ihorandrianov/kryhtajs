@@ -88,8 +88,8 @@ pub enum Token<'a> {
     Dot,
     Colon,
     Semicolon,
-    Arrow,      // =>
-    ThinArrow,  // ->
+    Arrow,     // =>
+    ThinArrow, // ->
     Spread,
     Eof,
 }
@@ -253,7 +253,7 @@ impl<'a> Lexer<'a> {
             "instanceof" => Token::InstanceOf,
             "in" => Token::In,
             "of" => Token::Of,
-            _ => Token::Identifier(text)
+            _ => Token::Identifier(text),
         }
     }
 

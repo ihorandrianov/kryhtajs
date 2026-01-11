@@ -1287,7 +1287,7 @@ impl CEKH {
                 self.try_match_arms(val, arms_start, arms_idx, arms_count, env, k, ast)?;
             }
 
-            // === Handler (user implements) ===
+            // Handler
             Kont::HandlerK { k, .. } => {
                 // Just pass through value for now
                 self.control = Control::Value(val);

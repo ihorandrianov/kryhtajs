@@ -23,7 +23,7 @@ pub mod value;
 // Re-exports
 pub use arena::{Arena, ArenaId};
 pub use ast::{AstArena, Expr, ExprId, Stmt, StmtId};
-pub use cekh::{Control, CEKH};
+pub use cekh::{CEKH, Control};
 pub use cont::{ContArena, ContId, Kont};
 pub use env::{Env, EnvArena, EnvId};
 pub use error::{JSError, Result};

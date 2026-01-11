@@ -69,10 +69,7 @@ pub enum Pattern {
     /// Variable binding: x (binds matched value to name)
     Var(StrId),
     /// Array destructuring: [a, b, c]
-    Array {
-        elems_start: u32,
-        elems_count: u16,
-    },
+    Array { elems_start: u32, elems_count: u16 },
     /// Object destructuring: {x, y: pat}
     Object {
         fields_start: u32,
@@ -97,15 +94,15 @@ pub struct PatternField {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MatchArm {
     pub pattern: PatternId,
-    pub guard: ExprId,  // ExprId::NONE if no guard
+    pub guard: ExprId, // ExprId::NONE if no guard
     pub body: ExprId,
 }
 
 /// Effect handler clause: EffectName!(params, resume) => body
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EffectClause {
-    pub effect: StrId,           // effect name (e.g., "Get")
-    pub params_start: u32,       // parameters including resume as last
+    pub effect: StrId,     // effect name (e.g., "Get")
+    pub params_start: u32, // parameters including resume as last
     pub params_count: u16,
     pub body: ExprId,
 }
@@ -217,7 +214,7 @@ pub enum Expr {
     Block {
         stmts_start: u32,
         stmts_count: u32,
-        final_expr: ExprId,  // ExprId::NONE means undefined
+        final_expr: ExprId, // ExprId::NONE means undefined
     },
     /// Match expression: match (scrutinee) { arms }
     Match {
@@ -236,8 +233,8 @@ pub enum Expr {
         body: ExprId,
         clauses_start: u32,
         clauses_count: u16,
-        return_param: StrId,    // parameter name for return clause (StrId::NONE if no return)
-        return_body: ExprId,    // ExprId::NONE if no return clause
+        return_param: StrId, // parameter name for return clause (StrId::NONE if no return)
+        return_body: ExprId, // ExprId::NONE if no return clause
     },
 }
 
@@ -257,20 +254,57 @@ pub struct PropEntry {
 pub enum Stmt {
     Empty,
     Expr(ExprId),
-    Let { name: StrId, init: ExprId },
-    Const { name: StrId, init: ExprId },
-    Var { name: StrId, init: ExprId },
-    If { test: ExprId, consequent: StmtId, alternate: StmtId },
-    While { test: ExprId, body: StmtId },
-    For { init: StmtId, test: ExprId, update: ExprId, body: StmtId },
-    Block { stmts_start: u32, stmts_count: u32 },
-    Declarations { stmts_start: u32, stmts_count: u32 },
+    Let {
+        name: StrId,
+        init: ExprId,
+    },
+    Const {
+        name: StrId,
+        init: ExprId,
+    },
+    Var {
+        name: StrId,
+        init: ExprId,
+    },
+    If {
+        test: ExprId,
+        consequent: StmtId,
+        alternate: StmtId,
+    },
+    While {
+        test: ExprId,
+        body: StmtId,
+    },
+    For {
+        init: StmtId,
+        test: ExprId,
+        update: ExprId,
+        body: StmtId,
+    },
+    Block {
+        stmts_start: u32,
+        stmts_count: u32,
+    },
+    Declarations {
+        stmts_start: u32,
+        stmts_count: u32,
+    },
     Return(ExprId),
     Break,
     Continue,
     Throw(ExprId),
-    Try { body: StmtId, catch_param: StrId, catch_body: StmtId, finally_body: StmtId },
-    Function { name: StrId, params_start: u32, params_count: u16, body: StmtId },
+    Try {
+        body: StmtId,
+        catch_param: StrId,
+        catch_body: StmtId,
+        finally_body: StmtId,
+    },
+    Function {
+        name: StrId,
+        params_start: u32,
+        params_count: u16,
+        body: StmtId,
+    },
 }
 
 impl Default for Stmt {
@@ -485,7 +519,11 @@ impl AstArena {
     }
 
     pub fn push_arm(&mut self, pattern: PatternId, guard: ExprId, body: ExprId) {
-        self.arms.push(MatchArm { pattern, guard, body });
+        self.arms.push(MatchArm {
+            pattern,
+            guard,
+            body,
+        });
     }
 
     pub fn get_arm_list(&self, start: u32, count: u16) -> &[MatchArm] {
@@ -503,8 +541,19 @@ impl AstArena {
         self.effect_clauses.len() as u32
     }
 
-    pub fn push_effect_clause(&mut self, effect: StrId, params_start: u32, params_count: u16, body: ExprId) {
-        self.effect_clauses.push(EffectClause { effect, params_start, params_count, body });
+    pub fn push_effect_clause(
+        &mut self,
+        effect: StrId,
+        params_start: u32,
+        params_count: u16,
+        body: ExprId,
+    ) {
+        self.effect_clauses.push(EffectClause {
+            effect,
+            params_start,
+            params_count,
+            body,
+        });
     }
 
     pub fn get_effect_clause_list(&self, start: u32, count: u16) -> &[EffectClause] {

@@ -125,12 +125,7 @@ impl FunctionData {
     }
 
     /// Create an arrow function with expression body
-    pub fn arrow_expr(
-        params_start: u32,
-        params_count: u16,
-        expr_body: ExprId,
-        env: EnvId,
-    ) -> Self {
+    pub fn arrow_expr(params_start: u32, params_count: u16, expr_body: ExprId, env: EnvId) -> Self {
         Self {
             params_start,
             params_count,

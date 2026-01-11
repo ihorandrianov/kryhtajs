@@ -18,9 +18,12 @@ pub enum Kont {
     /// Program complete - return final value
     Halt,
 
-    // === Unary/Binary Operators ===
+    // Unary/Binary Operators
     /// Unary operator waiting for operand
-    UnaryK { op: UnaryOp, k: ContId },
+    UnaryK {
+        op: UnaryOp,
+        k: ContId,
+    },
 
     /// Binary operator - evaluated left, waiting for right
     BinaryLeftK {
@@ -37,7 +40,7 @@ pub enum Kont {
         k: ContId,
     },
 
-    // === Short-Circuit Operators ===
+    // Short-Circuit Operators
     /// && - short-circuit if left is falsy
     AndK {
         right: ExprId,
@@ -59,9 +62,11 @@ pub enum Kont {
         k: ContId,
     },
 
-    // === Property/Index Access ===
-    /// obj.prop - have obj, access property
-    MemberK { property: StrId, k: ContId },
+    //Property/Index Access    /// obj.prop - have obj, access property
+    MemberK {
+        property: StrId,
+        k: ContId,
+    },
 
     /// obj[idx] - evaluating obj
     IndexObjK {
@@ -71,11 +76,17 @@ pub enum Kont {
     },
 
     /// obj[idx] - have obj, evaluating index
-    IndexKeyK { obj: JSValue, k: ContId },
+    IndexKeyK {
+        obj: JSValue,
+        k: ContId,
+    },
 
-    // === Assignment ===
-    /// x = expr - evaluating expr
-    AssignVarK { name: StrId, env: EnvId, k: ContId },
+    //Assignment    /// x = expr - evaluating expr
+    AssignVarK {
+        name: StrId,
+        env: EnvId,
+        k: ContId,
+    },
 
     /// obj.prop = expr - evaluating obj
     AssignMemberObjK {
@@ -115,8 +126,7 @@ pub enum Kont {
         k: ContId,
     },
 
-    // === Conditionals ===
-    /// if (test) { consequent } else { alternate }
+    //Conditionals    /// if (test) { consequent } else { alternate }
     IfK {
         consequent: StmtId,
         alternate: StmtId,
@@ -132,8 +142,7 @@ pub enum Kont {
         k: ContId,
     },
 
-    // === Loops ===
-    /// while (test) { body } - loop marker for break/continue
+    //Loops    /// while (test) { body } - loop marker for break/continue
     WhileK {
         test: ExprId,
         body: StmtId,
@@ -185,8 +194,7 @@ pub enum Kont {
         k: ContId,
     },
 
-    // === Function Calls ===
-    /// Evaluating callee - args to evaluate after
+    //Function Calls    /// Evaluating callee - args to evaluate after
     CalleeK {
         args_start: u32,
         args_count: u16,
@@ -206,10 +214,15 @@ pub enum Kont {
     },
 
     /// Return point - restore caller environment
-    ReturnK { env: EnvId, k: ContId },
+    ReturnK {
+        env: EnvId,
+        k: ContId,
+    },
 
     /// Return expression - convert value to Returning control
-    ReturnExprK { k: ContId },
+    ReturnExprK {
+        k: ContId,
+    },
 
     // Literals
     /// Array literal - evaluating elements
@@ -232,18 +245,28 @@ pub enum Kont {
         k: ContId,
     },
 
-    // === Variable Binding ===
-    /// let x = init
-    LetK { name: StrId, env: EnvId, k: ContId },
+    //Variable Binding    /// let x = init
+    LetK {
+        name: StrId,
+        env: EnvId,
+        k: ContId,
+    },
 
     /// const x = init
-    ConstK { name: StrId, env: EnvId, k: ContId },
+    ConstK {
+        name: StrId,
+        env: EnvId,
+        k: ContId,
+    },
 
     /// var x = init
-    VarK { name: StrId, env: EnvId, k: ContId },
+    VarK {
+        name: StrId,
+        env: EnvId,
+        k: ContId,
+    },
 
-    // === Statement Sequences ===
-    /// Block/sequence of statements
+    //Statement Sequences    /// Block/sequence of statements
     SeqK {
         stmts_start: u32,
         stmts_idx: u32,
@@ -253,10 +276,11 @@ pub enum Kont {
     },
 
     /// Expression statement - discard value
-    ExprStmtK { k: ContId },
+    ExprStmtK {
+        k: ContId,
+    },
 
-    // === Error Handling ===
-    /// try { body } catch (e) { handler } finally { finally }
+    //Error Handling    /// try { body } catch (e) { handler } finally { finally }
     TryK {
         catch_param: StrId,
         catch_body: StmtId,
@@ -275,10 +299,11 @@ pub enum Kont {
     },
 
     /// Throw expression - evaluating value to throw
-    ThrowK { k: ContId },
+    ThrowK {
+        k: ContId,
+    },
 
-    // === Block Expression ===
-    /// Block expression - evaluating statements, then final expr
+    //Block Expression    /// Block expression - evaluating statements, then final expr
     BlockK {
         stmts_start: u32,
         stmts_idx: u32,
@@ -288,8 +313,7 @@ pub enum Kont {
         k: ContId,
     },
 
-    // === Pattern Matching ===
-    /// Match expression - trying arms in order
+    //Pattern Matching    /// Match expression - trying arms in order
     MatchK {
         arms_start: u32,
         arms_idx: u16,

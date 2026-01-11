@@ -149,9 +149,7 @@ pub enum Effect {
     // Exception(JSValue),
 }
 
-// ============================================================
-// IMPLEMENTATION GUIDE
-// ============================================================
+// Implementation guide
 //
 // To implement algebraic effects:
 //

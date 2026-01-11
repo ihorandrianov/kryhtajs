@@ -116,7 +116,7 @@ impl<'a> Parser<'a> {
                     "Expected identifier",
                     self.lexer.line(),
                     self.lexer.column(),
-                ))
+                ));
             }
         };
         let init = if self.check(&Token::Eq) {
@@ -140,7 +140,7 @@ impl<'a> Parser<'a> {
                     "Expected identifier",
                     self.lexer.line(),
                     self.lexer.column(),
-                ))
+                ));
             }
         };
         self.consume(Token::Eq)?;
@@ -160,7 +160,7 @@ impl<'a> Parser<'a> {
                     "Expected identifier",
                     self.lexer.line(),
                     self.lexer.column(),
-                ))
+                ));
             }
         };
         let init = if self.check(&Token::Eq) {
@@ -258,7 +258,7 @@ impl<'a> Parser<'a> {
                     "Expected function name",
                     self.lexer.line(),
                     self.lexer.column(),
-                ))
+                ));
             }
         };
         let (params_start, params_count, body) = self.parse_function_params_body()?;
@@ -286,7 +286,7 @@ impl<'a> Parser<'a> {
                             "Expected parameter name",
                             self.lexer.line(),
                             self.lexer.column(),
-                        ))
+                        ));
                     }
                 }
                 if !self.check(&Token::Comma) {
@@ -356,9 +356,18 @@ impl<'a> Parser<'a> {
             // Check if this is a statement keyword
             let is_stmt_keyword = matches!(
                 &self.current,
-                Token::Let | Token::Const | Token::Var | Token::If | Token::While |
-                Token::For | Token::Function | Token::Return | Token::Break |
-                Token::Continue | Token::Throw | Token::Try
+                Token::Let
+                    | Token::Const
+                    | Token::Var
+                    | Token::If
+                    | Token::While
+                    | Token::For
+                    | Token::Function
+                    | Token::Return
+                    | Token::Break
+                    | Token::Continue
+                    | Token::Throw
+                    | Token::Try
             );
 
             if is_stmt_keyword {
@@ -611,7 +620,7 @@ impl<'a> Parser<'a> {
                                 "Expected property name",
                                 self.lexer.line(),
                                 self.lexer.column(),
-                            ))
+                            ));
                         }
                     };
                     expr = self.arena.alloc_expr(Expr::Member {
@@ -623,7 +632,10 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     let index = self.parse_expression()?;
                     self.consume(Token::RBracket)?;
-                    expr = self.arena.alloc_expr(Expr::Index { object: expr, index });
+                    expr = self.arena.alloc_expr(Expr::Index {
+                        object: expr,
+                        index,
+                    });
                 }
                 _ => break,
             }
@@ -693,7 +705,7 @@ impl<'a> Parser<'a> {
                                     "Expected property name",
                                     self.lexer.line(),
                                     self.lexer.column(),
-                                ))
+                                ));
                             }
                         };
                         self.consume(Token::Colon)?;
@@ -739,9 +751,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // ================================================================
-    // ARROW FUNCTION OR PARENTHESIZED EXPRESSION
-    // ================================================================
+    // Arrow function or parenthesized expression
 
     /// Parse either (expr) or (params) => body
     /// Called after consuming '('
@@ -872,9 +882,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // ================================================================
-    // PATTERN MATCHING
-    // ================================================================
+    // Pattern matching
 
     /// Parse: match (scrutinee) { pattern => expr, ... }
     fn parse_match_expr(&mut self) -> Result<ExprId> {
@@ -1029,7 +1037,7 @@ impl<'a> Parser<'a> {
                                     "Expected property name in object pattern",
                                     self.lexer.line(),
                                     self.lexer.column(),
-                                ))
+                                ));
                             }
                         };
 
@@ -1067,9 +1075,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // ================================================================
-    // ALGEBRAIC EFFECTS
-    // ================================================================
+    // Algebraic effects
 
     /// Parse: perform EffectName!(args)
     fn parse_perform_expr(&mut self) -> Result<ExprId> {
@@ -1087,7 +1093,7 @@ impl<'a> Parser<'a> {
                     "Expected effect name after 'perform'",
                     self.lexer.line(),
                     self.lexer.column(),
-                ))
+                ));
             }
         };
 
@@ -1156,7 +1162,7 @@ impl<'a> Parser<'a> {
                             "Expected parameter name in return clause",
                             self.lexer.line(),
                             self.lexer.column(),
-                        ))
+                        ));
                     }
                 };
 
@@ -1176,7 +1182,7 @@ impl<'a> Parser<'a> {
                             "Expected effect name",
                             self.lexer.line(),
                             self.lexer.column(),
-                        ))
+                        ));
                     }
                 };
 
@@ -1202,7 +1208,7 @@ impl<'a> Parser<'a> {
                                     "Expected parameter name",
                                     self.lexer.line(),
                                     self.lexer.column(),
-                                ))
+                                ));
                             }
                         };
                         self.arena.push_param_list(param);
@@ -1224,7 +1230,8 @@ impl<'a> Parser<'a> {
                     self.parse_expression()?
                 };
 
-                self.arena.push_effect_clause(effect, params_start, params_count, clause_body);
+                self.arena
+                    .push_effect_clause(effect, params_start, params_count, clause_body);
                 clauses_count += 1;
             }
 
