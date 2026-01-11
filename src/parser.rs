@@ -743,6 +743,7 @@ impl<'a> Parser<'a> {
             Token::Match => self.parse_match_expr(),
             Token::Perform => self.parse_perform_expr(),
             Token::Handle => self.parse_handle_expr(),
+            Token::Do => self.parse_block_expr(),
             _ => Err(JSError::syntax(
                 "Unexpected token",
                 self.lexer.line(),
