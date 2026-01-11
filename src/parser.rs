@@ -591,13 +591,12 @@ impl<'a> Parser<'a> {
             match &self.current {
                 Token::LParen => {
                     self.advance()?;
-                    let args_start = self.arena.start_expr_list();
-                    let mut args_count = 0u16;
+                    // Collect args in temp vec to avoid nested calls corrupting expr_lists
+                    let mut args = Vec::new();
                     if !self.check(&Token::RParen) {
                         loop {
                             let arg = self.parse_expression()?;
-                            self.arena.push_expr_list(arg);
-                            args_count += 1;
+                            args.push(arg);
                             if !self.check(&Token::Comma) {
                                 break;
                             }
@@ -605,6 +604,12 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.consume(Token::RParen)?;
+                    // Now push all args at once
+                    let args_start = self.arena.start_expr_list();
+                    let args_count = args.len() as u16;
+                    for arg in args {
+                        self.arena.push_expr_list(arg);
+                    }
                     expr = self.arena.alloc_expr(Expr::Call {
                         callee: expr,
                         args_start,
@@ -673,13 +678,12 @@ impl<'a> Parser<'a> {
                 self.try_parse_arrow_or_paren()
             }
             Token::LBracket => {
-                let elems_start = self.arena.start_expr_list();
-                let mut elems_count = 0u16;
+                // Collect elements in temp vec to avoid nested exprs corrupting expr_lists
+                let mut elems = Vec::new();
                 if !self.check(&Token::RBracket) {
                     loop {
                         let elem = self.parse_expression()?;
-                        self.arena.push_expr_list(elem);
-                        elems_count += 1;
+                        elems.push(elem);
                         if !self.check(&Token::Comma) {
                             break;
                         }
@@ -687,14 +691,19 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.consume(Token::RBracket)?;
+                let elems_start = self.arena.start_expr_list();
+                let elems_count = elems.len() as u16;
+                for elem in elems {
+                    self.arena.push_expr_list(elem);
+                }
                 Ok(self.arena.alloc_expr(Expr::Array {
                     elems_start,
                     elems_count,
                 }))
             }
             Token::LBrace => {
-                let props_start = self.arena.start_prop_list();
-                let mut props_count = 0u16;
+                // Collect props in temp vec to avoid nested exprs corrupting prop_lists
+                let mut props = Vec::new();
                 if !self.check(&Token::RBrace) {
                     loop {
                         let key = match self.advance()? {
@@ -710,8 +719,7 @@ impl<'a> Parser<'a> {
                         };
                         self.consume(Token::Colon)?;
                         let value = self.parse_expression()?;
-                        self.arena.push_prop_list(key, value);
-                        props_count += 1;
+                        props.push((key, value));
                         if !self.check(&Token::Comma) {
                             break;
                         }
@@ -719,6 +727,11 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.consume(Token::RBrace)?;
+                let props_start = self.arena.start_prop_list();
+                let props_count = props.len() as u16;
+                for (key, value) in props {
+                    self.arena.push_prop_list(key, value);
+                }
                 Ok(self.arena.alloc_expr(Expr::Object {
                     props_start,
                     props_count,
@@ -1104,14 +1117,12 @@ impl<'a> Parser<'a> {
         // Expect ( args )
         self.consume(Token::LParen)?;
 
-        let args_start = self.arena.start_expr_list();
-        let mut args_count = 0u16;
-
+        // Collect args in temp vec to avoid nested exprs corrupting expr_lists
+        let mut args = Vec::new();
         if !self.check(&Token::RParen) {
             loop {
                 let arg = self.parse_expression()?;
-                self.arena.push_expr_list(arg);
-                args_count += 1;
+                args.push(arg);
                 if !self.check(&Token::Comma) {
                     break;
                 }
@@ -1120,6 +1131,12 @@ impl<'a> Parser<'a> {
         }
 
         self.consume(Token::RParen)?;
+
+        let args_start = self.arena.start_expr_list();
+        let args_count = args.len() as u16;
+        for arg in args {
+            self.arena.push_expr_list(arg);
+        }
 
         Ok(self.arena.alloc_expr(Expr::Perform {
             effect,
