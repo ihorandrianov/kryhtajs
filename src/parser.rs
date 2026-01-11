@@ -57,7 +57,6 @@ impl<'a> Parser<'a> {
             let stmt = self.parse_statement()?;
             root_stmts.push(stmt);
         }
-        // Now push root statements to stmt_lists
         let start = self.arena.start_stmt_list();
         for stmt in &root_stmts {
             self.arena.push_stmt_list(*stmt);
@@ -333,7 +332,6 @@ impl<'a> Parser<'a> {
             block_stmts.push(stmt);
         }
         self.consume(Token::RBrace)?;
-        // Now push block statements
         let start = self.arena.start_stmt_list();
         for stmt in &block_stmts {
             self.arena.push_stmt_list(*stmt);
@@ -353,7 +351,6 @@ impl<'a> Parser<'a> {
         let mut final_expr = ExprId::NONE;
 
         while !self.check(&Token::RBrace) {
-            // Check if this is a statement keyword
             let is_stmt_keyword = matches!(
                 &self.current,
                 Token::Let
@@ -374,19 +371,15 @@ impl<'a> Parser<'a> {
                 let stmt = self.parse_statement()?;
                 stmts.push(stmt);
             } else {
-                // Parse as expression
                 let expr = self.parse_expression()?;
 
                 if self.check(&Token::Semicolon) {
-                    // Expression statement - not the final value
                     self.advance()?;
                     let stmt = self.arena.alloc_stmt(Stmt::Expr(expr));
                     stmts.push(stmt);
                 } else if self.check(&Token::RBrace) {
-                    // No semicolon and at end - this is the final expression
                     final_expr = expr;
                 } else {
-                    // No semicolon but not at end - treat as expression statement
                     let stmt = self.arena.alloc_stmt(Stmt::Expr(expr));
                     stmts.push(stmt);
                 }
@@ -395,7 +388,6 @@ impl<'a> Parser<'a> {
 
         self.consume(Token::RBrace)?;
 
-        // Push statements to arena
         let stmts_start = self.arena.start_stmt_list();
         for stmt in &stmts {
             self.arena.push_stmt_list(*stmt);
@@ -604,7 +596,6 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.consume(Token::RParen)?;
-                    // Now push all args at once
                     let args_start = self.arena.start_expr_list();
                     let args_count = args.len() as u16;
                     for arg in args {
@@ -777,7 +768,6 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 return self.parse_arrow_body(0, 0);
             } else {
-                // Empty parens not followed by => is an error
                 return Err(JSError::syntax(
                     "Empty parentheses",
                     self.lexer.line(),
@@ -876,7 +866,6 @@ impl<'a> Parser<'a> {
     /// Parse arrow function body (expression or block)
     fn parse_arrow_body(&mut self, params_start: u32, params_count: u16) -> Result<ExprId> {
         if self.check(&Token::LBrace) {
-            // Block body
             let body = self.parse_block()?;
             Ok(self.arena.alloc_expr(Expr::Arrow {
                 params_start,
@@ -885,7 +874,6 @@ impl<'a> Parser<'a> {
                 is_block: true,
             }))
         } else {
-            // Expression body
             let body = self.parse_expression()?;
             Ok(self.arena.alloc_expr(Expr::Arrow {
                 params_start,
@@ -896,11 +884,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Pattern matching
-
     /// Parse: match (scrutinee) { pattern => expr, ... }
     fn parse_match_expr(&mut self) -> Result<ExprId> {
-        // 'match' already consumed by parse_primary
         self.consume(Token::LParen)?;
         let scrutinee = self.parse_expression()?;
         self.consume(Token::RParen)?;
@@ -914,7 +899,6 @@ impl<'a> Parser<'a> {
             self.arena.push_arm(pattern, guard, body);
             arms_count += 1;
 
-            // Arms separated by commas (optional trailing comma)
             if self.check(&Token::Comma) {
                 self.advance()?;
             }
@@ -933,7 +917,6 @@ impl<'a> Parser<'a> {
     fn parse_match_arm(&mut self) -> Result<(PatternId, ExprId, ExprId)> {
         let pattern = self.parse_pattern()?;
 
-        // Optional guard: if condition
         let guard = if self.check(&Token::If) {
             self.advance()?;
             self.parse_expression()?
@@ -950,20 +933,17 @@ impl<'a> Parser<'a> {
     /// Parse a pattern: _, literal, identifier, [patterns], {fields}
     fn parse_pattern(&mut self) -> Result<PatternId> {
         match &self.current {
-            // Wildcard: _
             Token::Identifier(s) if *s == "_" => {
                 self.advance()?;
                 Ok(self.arena.alloc_pattern(Pattern::Wildcard))
             }
 
-            // Variable binding or identifier pattern
             Token::Identifier(s) => {
                 let name = self.strings.intern(s);
                 self.advance()?;
                 Ok(self.arena.alloc_pattern(Pattern::Var(name)))
             }
 
-            // Literal patterns
             Token::Undefined => {
                 self.advance()?;
                 let expr_id = self.arena.alloc_expr(Expr::Undefined);
@@ -1002,7 +982,6 @@ impl<'a> Parser<'a> {
                 Ok(self.arena.alloc_pattern(Pattern::Literal(expr_id)))
             }
 
-            // Array pattern: [p1, p2, ...]
             Token::LBracket => {
                 self.advance()?;
                 let elems_start = self.arena.start_pattern_list();
@@ -1027,7 +1006,6 @@ impl<'a> Parser<'a> {
                 }))
             }
 
-            // Object pattern: {key: pattern, ...} or {key, ...}
             Token::LBrace => {
                 self.advance()?;
                 let fields_start = self.arena.start_pattern_field_list();
@@ -1055,12 +1033,10 @@ impl<'a> Parser<'a> {
                             }
                         };
 
-                        // Either {key: pattern} or shorthand {key}
                         let pattern = if self.check(&Token::Colon) {
                             self.advance()?;
                             self.parse_pattern()?
                         } else {
-                            // Shorthand: {x} means {x: x}
                             self.arena.alloc_pattern(Pattern::Var(key))
                         };
 
@@ -1089,13 +1065,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Algebraic effects
-
     /// Parse: perform EffectName!(args)
     fn parse_perform_expr(&mut self) -> Result<ExprId> {
-        // 'perform' already consumed by parse_primary
-
-        // Expect identifier for effect name
         let effect = match &self.current {
             Token::Identifier(s) => {
                 let id = self.strings.intern(s);
@@ -1111,10 +1082,8 @@ impl<'a> Parser<'a> {
             }
         };
 
-        // Expect ! for effect call
         self.consume(Token::Bang)?;
 
-        // Expect ( args )
         self.consume(Token::LParen)?;
 
         // Collect args in temp vec to avoid nested exprs corrupting expr_lists
@@ -1147,15 +1116,10 @@ impl<'a> Parser<'a> {
 
     /// Parse: handle { body } with { effect_clauses }
     fn parse_handle_expr(&mut self) -> Result<ExprId> {
-        // 'handle' already consumed by parse_primary
-
-        // Parse body as block expression (supports statements + final expr)
         let body = self.parse_block_expr()?;
 
-        // Expect 'with'
         self.consume(Token::With)?;
 
-        // Parse handler clauses
         self.consume(Token::LBrace)?;
 
         let clauses_start = self.arena.start_effect_clause_list();
@@ -1164,7 +1128,6 @@ impl<'a> Parser<'a> {
         let mut return_body = ExprId::NONE;
 
         while !self.check(&Token::RBrace) {
-            // Check for 'return' clause
             if self.check(&Token::Return) {
                 self.advance()?;
                 self.consume(Token::LParen)?;
@@ -1188,7 +1151,6 @@ impl<'a> Parser<'a> {
                 self.consume(Token::ThinArrow)?;
                 return_body = self.parse_expression()?;
             } else {
-                // Effect clause: EffectName!(params) => body
                 let effect = match &self.current {
                     Token::Identifier(s) => {
                         let id = self.strings.intern(s);
@@ -1204,10 +1166,8 @@ impl<'a> Parser<'a> {
                     }
                 };
 
-                // Expect !
                 self.consume(Token::Bang)?;
 
-                // Parse params (including resume as last)
                 self.consume(Token::LParen)?;
 
                 let params_start = self.arena.start_param_list();
@@ -1241,7 +1201,6 @@ impl<'a> Parser<'a> {
                 self.consume(Token::RParen)?;
                 self.consume(Token::ThinArrow)?;
 
-                // Allow block expressions as clause body
                 let clause_body = if self.check(&Token::LBrace) {
                     self.parse_block_expr()?
                 } else {
@@ -1253,7 +1212,6 @@ impl<'a> Parser<'a> {
                 clauses_count += 1;
             }
 
-            // Clauses separated by commas (optional trailing comma)
             if self.check(&Token::Comma) {
                 self.advance()?;
             }

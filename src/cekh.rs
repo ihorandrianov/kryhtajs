@@ -89,15 +89,12 @@ impl CEKH {
         machine
     }
 
-    /// Run a program (list of statements)
     pub fn run(&mut self, ast: &AstArena) -> Result<JSValue> {
-        // Set up initial state: sequence of root statements
         let stmts = ast.get_stmt_list(ast.root_start, ast.root_count);
         if stmts.is_empty() {
             return Ok(JSValue::Undefined);
         }
 
-        // Start with first statement
         self.control = Control::Stmt(stmts[0]);
         self.env = self.envs.global();
         self.cont = if stmts.len() > 1 {
@@ -112,7 +109,6 @@ impl CEKH {
             self.conts.halt()
         };
 
-        // Run until halted
         loop {
             match &self.control {
                 Control::Halted(val) => return Ok(*val),
@@ -121,7 +117,6 @@ impl CEKH {
         }
     }
 
-    /// Single step of the machine
     pub fn step(&mut self, ast: &AstArena) -> Result<()> {
         match self.control.clone() {
             Control::Expr(expr_id) => self.step_expr(expr_id, ast),
@@ -160,7 +155,6 @@ impl CEKH {
             }
 
             Expr::Identifier(name) => {
-                // Look up in environment chain
                 if let Some(val) = self.envs.lookup(self.env, name) {
                     self.control = Control::Value(val);
                 } else if let Some(val) = self.globals.get(&name) {
@@ -208,7 +202,6 @@ impl CEKH {
                         });
                     }
                     _ => {
-                        // Regular binary: evaluate left first
                         self.control = Control::Expr(left);
                         self.cont = self.conts.alloc(Kont::BinaryLeftK {
                             op,
@@ -238,7 +231,6 @@ impl CEKH {
             }
 
             Expr::Assign { target, value } => {
-                // Determine assignment target type
                 if let Some(target_expr) = ast.get_expr(target) {
                     match target_expr {
                         Expr::Identifier(name) => {
@@ -295,12 +287,10 @@ impl CEKH {
                 elems_count,
             } => {
                 if elems_count == 0 {
-                    // Empty array
                     let arr_obj = Object::array();
                     let arr_id = self.objects.alloc(arr_obj);
                     self.control = Control::Value(JSValue::Array(ObjId(arr_id.index() as u32)));
                 } else {
-                    // Evaluate first element
                     let elems = ast.get_expr_list(elems_start, elems_count);
                     self.control = Control::Expr(elems[0]);
                     self.cont = self.conts.alloc(Kont::ArrayK {
@@ -319,12 +309,10 @@ impl CEKH {
                 props_count,
             } => {
                 if props_count == 0 {
-                    // Empty object
                     let obj = Object::new();
                     let obj_id = self.objects.alloc(obj);
                     self.control = Control::Value(JSValue::Object(ObjId(obj_id.index() as u32)));
                 } else {
-                    // Evaluate first property value
                     let props = ast.get_prop_list(props_start, props_count);
                     self.control = Control::Expr(props[0].value);
                     self.cont = self.conts.alloc(Kont::ObjectK {
@@ -381,7 +369,6 @@ impl CEKH {
                     // This is a parser quirk - the body ExprId contains a StmtId value
                     FunctionData::arrow_block(params_start, params_count, StmtId(body.0), self.env)
                 } else {
-                    // Arrow with expression body
                     FunctionData::arrow_expr(params_start, params_count, body, self.env)
                 };
                 let func_obj = Object::closure(func_data);
@@ -395,14 +382,12 @@ impl CEKH {
                 final_expr,
             } => {
                 if stmts_count == 0 {
-                    // No statements, just evaluate final expression
                     if final_expr.is_none() {
                         self.control = Control::Value(JSValue::Undefined);
                     } else {
                         self.control = Control::Expr(final_expr);
                     }
                 } else {
-                    // Evaluate statements first, then final expression
                     let stmts = ast.get_stmt_list(stmts_start, stmts_count);
                     self.control = Control::Stmt(stmts[0]);
                     self.cont = self.conts.alloc(Kont::BlockK {
@@ -421,7 +406,6 @@ impl CEKH {
                 arms_start,
                 arms_count,
             } => {
-                // Evaluate scrutinee first, then match against arms
                 self.control = Control::Expr(scrutinee);
                 self.cont = self.conts.alloc(Kont::MatchK {
                     arms_start,
@@ -532,7 +516,6 @@ impl CEKH {
                         k: self.cont,
                     });
                 } else {
-                    // var hoisting: define as undefined at global level
                     self.globals.insert(name, JSValue::Undefined);
                     self.control = Control::Value(JSValue::Undefined);
                 }
@@ -568,11 +551,9 @@ impl CEKH {
                 update,
                 body,
             } => {
-                // Create new scope for loop
                 let loop_env = self.envs.extend(self.env);
 
                 if init.is_some() {
-                    // Execute init, then start loop
                     self.control = Control::Stmt(init);
                     self.env = loop_env;
                     self.cont = self.conts.alloc(Kont::ForTestK {
@@ -583,7 +564,6 @@ impl CEKH {
                         k: self.cont,
                     });
                 } else {
-                    // No init, evaluate test
                     self.control = Control::Expr(test);
                     self.env = loop_env;
                     self.cont = self.conts.alloc(Kont::ForTestK {
@@ -604,7 +584,6 @@ impl CEKH {
                 if stmts.is_empty() {
                     self.control = Control::Value(JSValue::Undefined);
                 } else {
-                    // New scope for block
                     let block_env = self.envs.extend(self.env);
                     self.control = Control::Stmt(stmts[0]);
                     self.env = block_env;
@@ -643,7 +622,6 @@ impl CEKH {
 
             Stmt::Return(expr) => {
                 if expr.is_some() {
-                    // Evaluate expression, then set Returning control
                     self.control = Control::Expr(expr);
                     self.cont = self.conts.alloc(Kont::ReturnExprK { k: self.cont });
                 } else {
@@ -692,7 +670,6 @@ impl CEKH {
                 let func_id = self.objects.alloc(func_obj);
                 let func_val = JSValue::Function(ObjId(func_id.index() as u32));
 
-                // Bind in current environment and globals
                 self.envs.define(self.env, name, func_val);
                 self.globals.insert(name, func_val);
                 self.control = Control::Value(JSValue::Undefined);
@@ -784,9 +761,7 @@ impl CEKH {
             }
 
             Kont::AssignVarK { name, env, k } => {
-                // Try environment chain first
                 if !self.envs.assign(env, name, val) {
-                    // Not found in env, assign to global
                     self.globals.insert(name, val);
                 }
                 self.control = Control::Value(val);
@@ -880,19 +855,16 @@ impl CEKH {
 
             Kont::WhileK { test, body, env, k } => {
                 if self.is_truthy(val) {
-                    // Execute body, then re-test
                     self.control = Control::Stmt(body);
                     self.env = env;
                     self.cont = self.conts.alloc(Kont::WhileBodyK { test, body, env, k });
                 } else {
-                    // Exit loop
                     self.control = Control::Value(JSValue::Undefined);
                     self.cont = k;
                 }
             }
 
             Kont::WhileBodyK { test, body, env, k } => {
-                // Body done, re-test
                 self.control = Control::Expr(test);
                 self.env = env;
                 self.cont = self.conts.alloc(Kont::WhileK { test, body, env, k });
@@ -905,7 +877,6 @@ impl CEKH {
                 env,
                 k,
             } => {
-                // Evaluate test expression (ignore val - it's from init/body)
                 if test.is_some() {
                     self.control = Control::Expr(test);
                     self.env = env;
@@ -917,7 +888,6 @@ impl CEKH {
                         k,
                     });
                 } else {
-                    // No test means always continue
                     self.control = Control::Stmt(body);
                     self.env = env;
                     self.cont = self.conts.alloc(Kont::ForBodyK {
@@ -930,7 +900,6 @@ impl CEKH {
                 }
             }
 
-            // For loop test result - check if we should continue
             Kont::ForTestResultK {
                 test,
                 update,
@@ -961,7 +930,6 @@ impl CEKH {
                 env,
                 k,
             } => {
-                // Body done, execute update
                 if update.is_some() {
                     self.control = Control::Expr(update);
                     self.env = env;
@@ -973,7 +941,6 @@ impl CEKH {
                         k,
                     });
                 } else {
-                    // No update, go to test
                     if test.is_some() {
                         self.control = Control::Expr(test);
                     } else {
@@ -997,7 +964,6 @@ impl CEKH {
                 env,
                 k,
             } => {
-                // Update done, go to test
                 if test.is_some() {
                     self.control = Control::Expr(test);
                 } else {
@@ -1020,10 +986,8 @@ impl CEKH {
                 k,
             } => {
                 if args_count == 0 {
-                    // No arguments, call immediately
                     self.call_function(val, Vec::new(), k, ast)?;
                 } else {
-                    // Evaluate first argument
                     let args = ast.get_expr_list(args_start, args_count);
                     self.control = Control::Expr(args[0]);
                     self.env = env;
@@ -1051,10 +1015,8 @@ impl CEKH {
                 done.push(val);
 
                 if args_idx >= args_count {
-                    // All args evaluated, call function
                     self.call_function(callee, done, k, ast)?;
                 } else {
-                    // More args to evaluate
                     let args = ast.get_expr_list(args_start, args_count);
                     self.control = Control::Expr(args[args_idx as usize]);
                     self.env = env;
@@ -1071,14 +1033,12 @@ impl CEKH {
             }
 
             Kont::ReturnK { env, k } => {
-                // Restore caller environment
                 self.env = env;
                 self.cont = k;
                 self.control = Control::Value(val);
             }
 
             Kont::ReturnExprK { k: _ } => {
-                // Convert value to Returning control
                 self.control = Control::Returning(val);
             }
 
@@ -1093,7 +1053,6 @@ impl CEKH {
                 done.push(val);
 
                 if elems_idx >= elems_count {
-                    // All elements evaluated, create array
                     let mut arr_obj = Object::array();
                     if let ObjectKind::Array(ref mut data) = arr_obj.kind {
                         data.elements = done;
@@ -1102,7 +1061,6 @@ impl CEKH {
                     self.control = Control::Value(JSValue::Array(ObjId(arr_id.index() as u32)));
                     self.cont = k;
                 } else {
-                    // More elements
                     let elems = ast.get_expr_list(elems_start, elems_count);
                     self.control = Control::Expr(elems[elems_idx as usize]);
                     self.env = env;
@@ -1125,13 +1083,11 @@ impl CEKH {
                 env,
                 k,
             } => {
-                // Get key for current value
                 let props = ast.get_prop_list(props_start, props_count);
                 let key = props[props_idx as usize - 1].key;
                 done.push((key, val));
 
                 if props_idx >= props_count {
-                    // All properties evaluated, create object
                     let mut obj = Object::new();
                     for (key, value) in done {
                         obj.properties.insert(key, Property::value(value));
@@ -1140,7 +1096,6 @@ impl CEKH {
                     self.control = Control::Value(JSValue::Object(ObjId(obj_id.index() as u32)));
                     self.cont = k;
                 } else {
-                    // More properties
                     self.control = Control::Expr(props[props_idx as usize].value);
                     self.env = env;
                     self.cont = self.conts.alloc(Kont::ObjectK {
@@ -1161,7 +1116,6 @@ impl CEKH {
             }
 
             Kont::VarK { name, env: _, k } => {
-                // var goes to globals
                 self.globals.insert(name, val);
                 self.control = Control::Value(JSValue::Undefined);
                 self.cont = k;
@@ -1176,11 +1130,9 @@ impl CEKH {
             } => {
                 let stmts = ast.get_stmt_list(stmts_start, stmts_count);
                 if stmts_idx >= stmts_count {
-                    // Sequence done
                     self.control = Control::Value(val);
                     self.cont = k;
                 } else {
-                    // More statements
                     self.control = Control::Stmt(stmts[stmts_idx as usize]);
                     self.env = env;
                     if stmts_idx + 1 < stmts_count {
@@ -1198,8 +1150,6 @@ impl CEKH {
             }
 
             Kont::ExprStmtK { k } => {
-                // Check if this was a return expression
-                // For return, we handled it specially in step_stmt
                 self.control = Control::Value(val);
                 self.cont = k;
             }
@@ -1210,7 +1160,6 @@ impl CEKH {
                 k,
                 ..
             } => {
-                // Try body completed successfully
                 if finally_body.is_some() {
                     self.control = Control::Stmt(finally_body);
                     self.env = env;
@@ -1230,7 +1179,6 @@ impl CEKH {
             Kont::FinallyK {
                 result, thrown, k, ..
             } => {
-                // Finally completed
                 if let Some(thrown_val) = thrown {
                     self.control = Control::Throwing(thrown_val);
                 } else {
@@ -1251,7 +1199,6 @@ impl CEKH {
                 env,
                 k,
             } => {
-                // Previous statement done, continue with next
                 if stmts_idx < stmts_count {
                     let stmts = ast.get_stmt_list(stmts_start, stmts_count);
                     self.control = Control::Stmt(stmts[stmts_idx as usize]);
@@ -1265,7 +1212,6 @@ impl CEKH {
                         k,
                     });
                 } else {
-                    // All statements done, evaluate final expression
                     self.env = env;
                     if final_expr.is_none() {
                         self.control = Control::Value(JSValue::Undefined);
@@ -1287,9 +1233,7 @@ impl CEKH {
                 self.try_match_arms(val, arms_start, arms_idx, arms_count, env, k, ast)?;
             }
 
-            // Handler
             Kont::HandlerK { k, .. } => {
-                // Just pass through value for now
                 self.control = Control::Value(val);
                 self.cont = k;
             }
@@ -1330,25 +1274,21 @@ impl CEKH {
     }
 
     fn handle_return(&mut self, val: JSValue, _ast: &AstArena) -> Result<()> {
-        // Search for ReturnK in continuation chain
         let mut k = self.cont;
         loop {
             if let Some(kont) = self.conts.get(k).cloned() {
                 match kont {
                     Kont::Halt => {
-                        // Returning from top-level
                         self.control = Control::Halted(val);
                         return Ok(());
                     }
                     Kont::ReturnK { env, k: outer } => {
-                        // Found return point
                         self.env = env;
                         self.cont = outer;
                         self.control = Control::Value(val);
                         return Ok(());
                     }
                     _ => {
-                        // Keep searching
                         if let Some(outer) = kont.outer() {
                             k = outer;
                         } else {
@@ -1361,19 +1301,16 @@ impl CEKH {
             }
         }
 
-        // No return point found, halt
         self.control = Control::Halted(val);
         Ok(())
     }
 
     fn handle_throw(&mut self, val: JSValue, _ast: &AstArena) -> Result<()> {
-        // Search for TryK in continuation chain
         let mut k = self.cont;
         loop {
             if let Some(kont) = self.conts.get(k).cloned() {
                 match kont {
                     Kont::Halt => {
-                        // Uncaught exception
                         return Err(JSError::UncaughtException(format!("{:?}", val)));
                     }
                     Kont::TryK {
@@ -1384,7 +1321,6 @@ impl CEKH {
                         k: outer,
                     } => {
                         if catch_body.is_some() {
-                            // Execute catch block
                             let catch_env = self.envs.bind(env, catch_param, val);
                             self.control = Control::Stmt(catch_body);
                             self.env = catch_env;
@@ -1401,7 +1337,6 @@ impl CEKH {
                                 self.cont = outer;
                             }
                         } else if finally_body.is_some() {
-                            // No catch, just finally
                             self.control = Control::Stmt(finally_body);
                             self.env = env;
                             self.cont = self.conts.alloc(Kont::FinallyK {
@@ -1412,7 +1347,6 @@ impl CEKH {
                                 k: outer,
                             });
                         } else {
-                            // Keep searching
                             k = outer;
                             continue;
                         }
@@ -1448,7 +1382,6 @@ impl CEKH {
                     | Kont::ForTestResultK { k: outer, .. }
                     | Kont::ForBodyK { k: outer, .. }
                     | Kont::ForUpdateK { k: outer, .. } => {
-                        // Found loop, exit it
                         self.control = Control::Value(JSValue::Undefined);
                         self.cont = outer;
                         return Ok(());
@@ -1489,7 +1422,6 @@ impl CEKH {
                         env,
                         k: outer,
                     } => {
-                        // Restart while loop at test
                         self.control = Control::Expr(test);
                         self.env = env;
                         self.cont = self.conts.alloc(Kont::WhileK {
@@ -1528,7 +1460,6 @@ impl CEKH {
                         env,
                         k: outer,
                     } => {
-                        // Go to update (or test if no update)
                         if update.is_some() {
                             self.control = Control::Expr(update);
                             self.env = env;
@@ -1605,7 +1536,6 @@ impl CEKH {
 
         match &obj.kind {
             ObjectKind::NativeFunction(native_fn) => {
-                // Call native function
                 let arg0 = args.first().copied().unwrap_or(JSValue::Undefined);
                 let arg1 = args.get(1).copied().unwrap_or(JSValue::Undefined);
                 let result = call_native(native_fn, arg0, arg1, &self.strings);
@@ -1616,29 +1546,22 @@ impl CEKH {
             ObjectKind::Function(func_data) => {
                 let func_data = func_data.clone();
 
-                // Get parameter names
                 let params = ast.get_param_list(func_data.params_start, func_data.params_count);
 
-                // Build bindings: params -> args
                 let mut bindings = HashMap::new();
                 for (i, param) in params.iter().enumerate() {
                     let arg = args.get(i).copied().unwrap_or(JSValue::Undefined);
                     bindings.insert(*param, arg);
                 }
 
-                // Extend captured environment with bindings
                 let call_env = self.envs.extend_with(func_data.env, bindings);
 
-                // Save return continuation
                 self.cont = self.conts.alloc(Kont::ReturnK { env: self.env, k });
 
-                // Set up for function body
                 self.env = call_env;
 
                 if let Some(expr_body) = func_data.expr_body {
-                    // Arrow with expression body - implicit return
                     self.control = Control::Expr(expr_body);
-                    // Use ReturnExprK to convert value to Returning control
                     let inner_k = self.cont;
                     self.cont = self.conts.alloc(Kont::ReturnExprK { k: inner_k });
                 } else if func_data.body.is_some() {
@@ -1695,9 +1618,7 @@ impl CEKH {
 
     fn apply_binary(&mut self, op: BinaryOp, left: JSValue, right: JSValue) -> Result<JSValue> {
         match op {
-            // Arithmetic
             BinaryOp::Add => {
-                // String concatenation or numeric addition
                 if matches!(left, JSValue::String(_)) || matches!(right, JSValue::String(_)) {
                     let left_str = self.to_string(left);
                     let right_str = self.to_string(right);
@@ -1736,7 +1657,6 @@ impl CEKH {
                 Ok(JSValue::Float(l.powf(r)))
             }
 
-            // Comparison
             BinaryOp::Eq => Ok(JSValue::Bool(self.strict_equals(left, right))),
             BinaryOp::Ne => Ok(JSValue::Bool(!self.strict_equals(left, right))),
             BinaryOp::Lt => {
@@ -1760,7 +1680,6 @@ impl CEKH {
                 Ok(JSValue::Bool(l >= r))
             }
 
-            // Bitwise
             BinaryOp::BitAnd => {
                 let l = self.to_i32(left);
                 let r = self.to_i32(right);
@@ -1792,7 +1711,6 @@ impl CEKH {
                 Ok(JSValue::Int((l >> r) as i32))
             }
 
-            // Short-circuit handled separately
             BinaryOp::And | BinaryOp::Or | BinaryOp::NullishCoalesce => {
                 unreachable!("Short-circuit operators handled in step_expr")
             }
@@ -1810,7 +1728,6 @@ impl CEKH {
             .get(obj_id.into_arena_id())
             .ok_or(JSError::InternalError("Invalid object"))?;
 
-        // Check for array length
         if let ObjectKind::Array(ref data) = obj.kind {
             if self
                 .strings
@@ -1844,7 +1761,6 @@ impl CEKH {
         let obj_id = match obj {
             JSValue::Array(id) => id,
             JSValue::Object(id) | JSValue::Function(id) => {
-                // Object property access with computed key
                 if let JSValue::String(str_id) = key {
                     return self.get_property(obj, str_id);
                 }
@@ -1884,7 +1800,6 @@ impl CEKH {
             _ => return Err(JSError::type_error("Cannot set index of non-object")),
         };
 
-        // Calculate index before borrowing object mutably
         let idx = self.to_i32(key);
 
         let obj = self
@@ -2013,16 +1928,12 @@ impl CEKH {
     ) -> Result<()> {
         let arms = ast.get_arm_list(arms_start, arms_count);
 
-        // Try each arm starting from arms_idx
         for idx in (arms_idx as usize)..arms.len() {
             let arm = &arms[idx];
 
-            // Try to match the pattern
             if let Some(bindings) = self.match_pattern(arm.pattern, val, ast)? {
-                // Pattern matched - extend environment with bindings
                 let match_env = self.envs.extend_with(env, bindings);
 
-                // Check guard if present
                 if arm.guard.is_some() {
                     // Need to evaluate guard - set up continuation to check result
                     // For now, skip guards (TODO: implement guard evaluation)
@@ -2032,7 +1943,6 @@ impl CEKH {
                     return Ok(());
                 }
 
-                // No guard - evaluate body
                 self.env = match_env;
                 self.control = Control::Expr(arm.body);
                 self.cont = k;
@@ -2040,7 +1950,6 @@ impl CEKH {
             }
         }
 
-        // No arm matched - throw error
         Err(JSError::runtime_error(
             "No pattern matched in match expression",
         ))
@@ -2057,20 +1966,15 @@ impl CEKH {
             .ok_or(JSError::InternalError("Invalid pattern ID"))?;
 
         match pattern {
-            Pattern::Wildcard => {
-                // Always matches, no bindings
-                Ok(Some(HashMap::new()))
-            }
+            Pattern::Wildcard => Ok(Some(HashMap::new())),
 
             Pattern::Var(name) => {
-                // Always matches, binds value to name
                 let mut bindings = HashMap::new();
                 bindings.insert(name, val);
                 Ok(Some(bindings))
             }
 
             Pattern::Literal(expr_id) => {
-                // Match against literal value
                 let lit_val = self.eval_literal(expr_id, ast)?;
                 if self.strict_equals(val, lit_val) {
                     Ok(Some(HashMap::new()))
@@ -2083,7 +1987,6 @@ impl CEKH {
                 elems_start,
                 elems_count,
             } => {
-                // Match array patterns
                 let arr_id = match val {
                     JSValue::Array(id) => id,
                     _ => return Ok(None),
@@ -2120,7 +2023,6 @@ impl CEKH {
                 fields_start,
                 fields_count,
             } => {
-                // Match object patterns
                 let obj_id = match val {
                     JSValue::Object(id) => id,
                     _ => return Ok(None),
@@ -2171,7 +2073,12 @@ impl CEKH {
         loop {
             if let Some(kont) = self.conts.get(k).cloned() {
                 match kont {
-                    Kont::Halt => return Err(JSError::runtime_error("Unhandled effect!")),
+                    Kont::Halt => {
+                        if self.try_native_effect(effect, &args)? {
+                            return Ok(());
+                        }
+                        return Err(JSError::runtime_error("Unhandled effect!"));
+                    }
                     Kont::HandlerK {
                         clauses_start,
                         clauses_count,
@@ -2211,11 +2118,24 @@ impl CEKH {
         }
     }
 
+    fn try_native_effect(&mut self, effect: StrId, args: &[JSValue]) -> Result<bool> {
+        let effect_name = self.strings.get(effect).unwrap_or("");
+
+        match effect_name {
+            "Print" => {
+                let output: Vec<String> =
+                    args.into_iter().map(|arg| self.to_string(*arg)).collect();
+                println!("{}", output.join(" "));
+                self.control = Control::Value(JSValue::Undefined);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn setup_builtins(&mut self) {
-        // Create Math object
         let mut math_obj = Object::new();
 
-        // Add Math functions
         let add_fn = |obj: &mut Object,
                       objects: &mut Arena<Object>,
                       strings: &mut StringPool,
@@ -2329,7 +2249,6 @@ impl CEKH {
             NativeFn::MathSign,
         );
 
-        // Add Math constants
         let pi_id = self.strings.intern("PI");
         math_obj.properties.insert(
             pi_id,
@@ -2342,7 +2261,6 @@ impl CEKH {
             Property::readonly(JSValue::Float(std::f64::consts::E)),
         );
 
-        // Register Math object
         let math_id = self.objects.alloc(math_obj);
         let math_name = self.strings.intern("Math");
         self.globals

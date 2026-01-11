@@ -463,7 +463,6 @@ impl AstArena {
         }
     }
 
-    // Pattern methods
     pub fn alloc_pattern(&mut self, pattern: Pattern) -> PatternId {
         let id = self.patterns.len() as u32;
         self.patterns.push(pattern);
@@ -513,7 +512,6 @@ impl AstArena {
         }
     }
 
-    // Match arm methods
     pub fn start_arm_list(&self) -> u32 {
         self.arms.len() as u32
     }
@@ -536,7 +534,6 @@ impl AstArena {
         }
     }
 
-    // Effect clause methods
     pub fn start_effect_clause_list(&self) -> u32 {
         self.effect_clauses.len() as u32
     }

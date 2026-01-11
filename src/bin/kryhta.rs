@@ -70,7 +70,6 @@ fn eval_line(machine: &mut CEKH, source: &str) -> Result<JSValue> {
     let (arena, strings) = parser.parse_program()?;
     machine.strings = strings;
 
-    // Run directly on AST
     machine.run(&arena)
 }
 

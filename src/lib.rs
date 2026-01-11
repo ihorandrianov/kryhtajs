@@ -20,7 +20,6 @@ pub mod parser;
 pub mod string_pool;
 pub mod value;
 
-// Re-exports
 pub use arena::{Arena, ArenaId};
 pub use ast::{AstArena, Expr, ExprId, Stmt, StmtId};
 pub use cekh::{CEKH, Control};
