@@ -656,9 +656,9 @@ impl<'a> Parser<'a> {
             }
             Token::This => Ok(self.arena.alloc_expr(Expr::This)),
             Token::LParen => {
-                let expr = self.parse_expression()?;
-                self.consume(Token::RParen)?;
-                Ok(expr)
+                // Could be: (expr) or (params) => body
+                // Try to parse as arrow function params first
+                self.try_parse_arrow_or_paren()
             }
             Token::LBracket => {
                 let elems_start = self.arena.start_expr_list();
@@ -736,6 +736,139 @@ impl<'a> Parser<'a> {
                 self.lexer.line(),
                 self.lexer.column(),
             )),
+        }
+    }
+
+    // ================================================================
+    // ARROW FUNCTION OR PARENTHESIZED EXPRESSION
+    // ================================================================
+
+    /// Parse either (expr) or (params) => body
+    /// Called after consuming '('
+    fn try_parse_arrow_or_paren(&mut self) -> Result<ExprId> {
+        // Case 1: () => body (no params)
+        if self.check(&Token::RParen) {
+            self.advance()?;
+            if self.check(&Token::Arrow) {
+                self.advance()?;
+                return self.parse_arrow_body(0, 0);
+            } else {
+                // Empty parens not followed by => is an error
+                return Err(JSError::syntax(
+                    "Empty parentheses",
+                    self.lexer.line(),
+                    self.lexer.column(),
+                ));
+            }
+        }
+
+        // Try to collect identifiers as potential arrow params
+        let params_start = self.arena.start_param_list();
+        #[allow(unused_assignments)]
+        let mut params_count = 0u16;
+        let mut is_arrow_params = true;
+
+        // First token must be identifier for arrow params
+        let first_ident = match &self.current {
+            Token::Identifier(s) => {
+                let id = self.strings.intern(s);
+                self.advance()?;
+                Some(id)
+            }
+            _ => None,
+        };
+
+        if let Some(first_id) = first_ident {
+            self.arena.push_param_list(first_id);
+            params_count = 1;
+
+            // Collect more params separated by commas
+            while self.check(&Token::Comma) && is_arrow_params {
+                self.advance()?;
+                match &self.current {
+                    Token::Identifier(s) => {
+                        let id = self.strings.intern(s);
+                        self.arena.push_param_list(id);
+                        params_count += 1;
+                        self.advance()?;
+                    }
+                    _ => {
+                        is_arrow_params = false;
+                    }
+                }
+            }
+
+            // Check for ) followed by =>
+            if is_arrow_params && self.check(&Token::RParen) {
+                self.advance()?;
+                if self.check(&Token::Arrow) {
+                    self.advance()?;
+                    return self.parse_arrow_body(params_start, params_count);
+                } else {
+                    // Not an arrow function - reconstruct as expression
+                    // For single identifier, return it as identifier expr
+                    if params_count == 1 {
+                        return Ok(self.arena.alloc_expr(Expr::Identifier(first_id)));
+                    }
+                    // Multiple identifiers without => is a syntax error (no comma operator)
+                    return Err(JSError::syntax(
+                        "Unexpected comma in expression",
+                        self.lexer.line(),
+                        self.lexer.column(),
+                    ));
+                }
+            }
+        }
+
+        // Not valid arrow params - parse as expression
+        // We need to handle partial consumption... this is tricky
+        // For now, fall back to error if we got here in a weird state
+        if !is_arrow_params || first_ident.is_none() {
+            // Parse the rest as an expression from current position
+            // If first_ident was consumed but we're not in arrow mode,
+            // we need to handle it differently
+            if first_ident.is_some() {
+                // We consumed an identifier and maybe some commas
+                // This is an error state for now
+                return Err(JSError::syntax(
+                    "Invalid parenthesized expression",
+                    self.lexer.line(),
+                    self.lexer.column(),
+                ));
+            }
+            // First token wasn't identifier - parse as regular expression
+            let expr = self.parse_expression()?;
+            self.consume(Token::RParen)?;
+            return Ok(expr);
+        }
+
+        Err(JSError::syntax(
+            "Unexpected token in parentheses",
+            self.lexer.line(),
+            self.lexer.column(),
+        ))
+    }
+
+    /// Parse arrow function body (expression or block)
+    fn parse_arrow_body(&mut self, params_start: u32, params_count: u16) -> Result<ExprId> {
+        if self.check(&Token::LBrace) {
+            // Block body
+            let body = self.parse_block()?;
+            Ok(self.arena.alloc_expr(Expr::Arrow {
+                params_start,
+                params_count,
+                body: ExprId(body.0),
+                is_block: true,
+            }))
+        } else {
+            // Expression body
+            let body = self.parse_expression()?;
+            Ok(self.arena.alloc_expr(Expr::Arrow {
+                params_start,
+                params_count,
+                body,
+                is_block: false,
+            }))
         }
     }
 
@@ -1028,7 +1161,7 @@ impl<'a> Parser<'a> {
                 };
 
                 self.consume(Token::RParen)?;
-                self.consume(Token::Arrow)?;
+                self.consume(Token::ThinArrow)?;
                 return_body = self.parse_expression()?;
             } else {
                 // Effect clause: EffectName!(params) => body
@@ -1082,9 +1215,14 @@ impl<'a> Parser<'a> {
                 }
 
                 self.consume(Token::RParen)?;
-                self.consume(Token::Arrow)?;
+                self.consume(Token::ThinArrow)?;
 
-                let clause_body = self.parse_expression()?;
+                // Allow block expressions as clause body
+                let clause_body = if self.check(&Token::LBrace) {
+                    self.parse_block_expr()?
+                } else {
+                    self.parse_expression()?
+                };
 
                 self.arena.push_effect_clause(effect, params_start, params_count, clause_body);
                 clauses_count += 1;

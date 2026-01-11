@@ -88,7 +88,8 @@ pub enum Token<'a> {
     Dot,
     Colon,
     Semicolon,
-    Arrow,
+    Arrow,      // =>
+    ThinArrow,  // ->
     Spread,
     Eof,
 }
@@ -342,6 +343,9 @@ impl<'a> Lexer<'a> {
                 } else if self.peek() == Some('=') {
                     self.advance();
                     Ok(Token::MinusEq)
+                } else if self.peek() == Some('>') {
+                    self.advance();
+                    Ok(Token::ThinArrow)
                 } else {
                     Ok(Token::Minus)
                 }

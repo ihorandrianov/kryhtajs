@@ -13,7 +13,7 @@ use crate::value::JSValue;
 pub type ContId = ArenaId<Kont>;
 
 /// Continuation frame - what to do when we have a value
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Kont {
     /// Program complete - return final value
     Halt,

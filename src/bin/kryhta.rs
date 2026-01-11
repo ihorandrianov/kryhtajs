@@ -3,7 +3,7 @@
 //! Uses CEKH machine for direct AST interpretation.
 
 use kryhta::parser::Parser;
-use kryhta::{JSError, JSValue, Result, CEKH};
+use kryhta::{CEKH, JSError, JSValue, Result};
 
 use std::io::{self, BufRead, Write};
 
@@ -135,7 +135,7 @@ fn print_value(val: &JSValue, machine: &CEKH) {
                 println!("[object Array]");
             }
         }
-        JSValue::Function(_) => println!("[Function]"),
+        JSValue::Function(_) | JSValue::Continuation(_, _) => println!("[Function]"),
     }
 }
 
@@ -167,6 +167,6 @@ fn format_value(val: &JSValue, machine: &CEKH) -> String {
         }
         JSValue::Object(_) => "[object Object]".to_string(),
         JSValue::Array(_) => "[Array]".to_string(),
-        JSValue::Function(_) => "[Function]".to_string(),
+        JSValue::Function(_) | JSValue::Continuation(_, _) => "[Function]".to_string(),
     }
 }

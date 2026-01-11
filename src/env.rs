@@ -14,7 +14,7 @@ use crate::value::JSValue;
 pub type EnvId = ArenaId<Env>;
 
 /// A single environment frame
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Env {
     /// Variable bindings in this frame
     bindings: HashMap<StrId, JSValue>,

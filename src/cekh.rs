@@ -1318,6 +1318,9 @@ impl CEKH {
                         k,
                     });
                 } else {
+                    // Pop PerformArgsK before calling do_perform so that the
+                    // captured continuation doesn't include PerformArgsK itself
+                    self.cont = k;
                     self.do_perform(effect, done, ast)?;
                 }
             }
@@ -1584,6 +1587,14 @@ impl CEKH {
     ) -> Result<()> {
         let obj_id = match callee {
             JSValue::Function(id) => id,
+            JSValue::Continuation(cont_id, env_id) => {
+                let value = args.first().copied().unwrap_or(JSValue::Undefined);
+
+                self.cont = cont_id;
+                self.env = env_id;
+                self.control = Control::Value(value);
+                return Ok(());
+            }
             _ => return Err(JSError::type_error("not a function")),
         };
 
@@ -1666,7 +1677,7 @@ impl CEKH {
                     JSValue::Int(_) | JSValue::Float(_) => "number",
                     JSValue::String(_) => "string",
                     JSValue::Object(_) | JSValue::Array(_) => "object",
-                    JSValue::Function(_) => "function",
+                    JSValue::Function(_) | JSValue::Continuation(_, _) => "function",
                 };
                 let str_id = self.strings.intern(type_str);
                 Ok(JSValue::String(str_id))
@@ -1905,7 +1916,10 @@ impl CEKH {
                 .get(str_id)
                 .map(|s| !s.is_empty())
                 .unwrap_or(false),
-            JSValue::Object(_) | JSValue::Array(_) | JSValue::Function(_) => true,
+            JSValue::Object(_)
+            | JSValue::Array(_)
+            | JSValue::Function(_)
+            | JSValue::Continuation(_, _) => true,
         }
     }
 
@@ -1958,6 +1972,7 @@ impl CEKH {
             JSValue::Object(_) => "[object Object]".to_string(),
             JSValue::Array(_) => "[object Array]".to_string(),
             JSValue::Function(_) => "[object Function]".to_string(),
+            JSValue::Continuation(_, _) => "[object Continuation]".to_string(),
         }
     }
 
@@ -2152,7 +2167,48 @@ impl CEKH {
     }
 
     fn do_perform(&mut self, effect: StrId, args: Vec<JSValue>, ast: &AstArena) -> Result<()> {
-        todo!()
+        let mut k = self.cont;
+        loop {
+            if let Some(kont) = self.conts.get(k).cloned() {
+                match kont {
+                    Kont::Halt => return Err(JSError::runtime_error("Unhandled effect!")),
+                    Kont::HandlerK {
+                        clauses_start,
+                        clauses_count,
+                        env,
+                        return_body: _,
+                        return_param: _,
+                        k: kk,
+                    } => {
+                        let clauses = ast.get_effect_clause_list(clauses_start, clauses_count);
+                        let Some(clause) = clauses.iter().find(|c| c.effect == effect) else {
+                            k = kk;
+                            continue;
+                        };
+                        let params = ast.get_param_list(clause.params_start, clause.params_count);
+                        let resume = JSValue::Continuation(self.cont, self.env);
+                        let mut bindings = HashMap::new();
+                        for (i, param) in params.iter().enumerate() {
+                            if i < args.len() {
+                                bindings.insert(*param, args[i].clone());
+                            }
+                        }
+                        if let Some(last) = params.last() {
+                            bindings.insert(*last, resume);
+                        }
+
+                        let clause_env = self.envs.extend_with(env, bindings);
+                        self.env = clause_env;
+                        self.control = Control::Expr(clause.body);
+                        self.cont = kk;
+                        return Ok(());
+                    }
+                    other => {
+                        k = other.outer().unwrap();
+                    }
+                }
+            }
+        }
     }
 
     fn setup_builtins(&mut self) {

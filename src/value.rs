@@ -3,6 +3,7 @@
 use crate::arena::ArenaId;
 use crate::object::Object;
 use crate::string_pool::StrId;
+use crate::{ContId, EnvId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct ObjId(pub u32);
@@ -31,6 +32,7 @@ pub enum JSValue {
     Object(ObjId),
     Function(ObjId),
     Array(ObjId),
+    Continuation(ContId, EnvId),
 }
 
 impl JSValue {
@@ -42,6 +44,7 @@ impl JSValue {
             JSValue::Float(f) => *f != 0.0 && !f.is_nan(),
             JSValue::String(s) => s.0 != 0,
             JSValue::Object(_) | JSValue::Function(_) | JSValue::Array(_) => true,
+            JSValue::Continuation(_, _) => true,
         }
     }
 
@@ -57,7 +60,7 @@ impl JSValue {
             JSValue::Int(_) | JSValue::Float(_) => "number",
             JSValue::String(_) => "string",
             JSValue::Object(_) | JSValue::Array(_) => "object",
-            JSValue::Function(_) => "function",
+            JSValue::Function(_) | JSValue::Continuation(_, _) => "function",
         }
     }
 
