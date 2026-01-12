@@ -79,3 +79,8 @@ fn test_do() {
 fn test_effects() {
     run_test_file(include_str!("fixtures/test_effects.js"), "effects");
 }
+
+#[test]
+fn test_handlers() {
+    run_test_file(include_str!("fixtures/test_handlers.js"), "handlers");
+}

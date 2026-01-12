@@ -88,6 +88,17 @@ pub enum Kont {
         k: ContId,
     },
 
+    /// ++x, x++, --x, x-- on a variable
+    /// `is_pre` = true for ++x/--x, false for x++/x--
+    /// `is_inc` = true for ++, false for --
+    UpdateVarK {
+        name: StrId,
+        is_pre: bool,
+        is_inc: bool,
+        env: EnvId,
+        k: ContId,
+    },
+
     /// obj.prop = expr - evaluating obj
     AssignMemberObjK {
         property: StrId,
@@ -194,7 +205,8 @@ pub enum Kont {
         k: ContId,
     },
 
-    //Function Calls    /// Evaluating callee - args to evaluate after
+    //Function Calls
+    /// Evaluating callee - args to evaluate after
     CalleeK {
         args_start: u32,
         args_count: u16,
@@ -342,6 +354,12 @@ pub enum Kont {
         env: EnvId,
         k: ContId,
     },
+
+    HandleWithK {
+        body: ExprId,
+        env: EnvId,
+        k: ContId,
+    },
 }
 
 impl Kont {
@@ -359,6 +377,7 @@ impl Kont {
             | Kont::IndexObjK { k, .. }
             | Kont::IndexKeyK { k, .. }
             | Kont::AssignVarK { k, .. }
+            | Kont::UpdateVarK { k, .. }
             | Kont::AssignMemberObjK { k, .. }
             | Kont::AssignMemberValK { k, .. }
             | Kont::AssignIndexObjK { k, .. }
@@ -389,7 +408,8 @@ impl Kont {
             | Kont::BlockK { k, .. }
             | Kont::MatchK { k, .. }
             | Kont::HandlerK { k, .. }
-            | Kont::PerformArgsK { k, .. } => Some(*k),
+            | Kont::PerformArgsK { k, .. }
+            | Kont::HandleWithK { k, .. } => Some(*k),
         }
     }
 

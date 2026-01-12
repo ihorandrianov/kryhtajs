@@ -135,6 +135,7 @@ fn print_value(val: &JSValue, machine: &CEKH) {
             }
         }
         JSValue::Function(_) | JSValue::Continuation(_, _) => println!("[Function]"),
+        JSValue::Handler(_) => println!("[Handler]"),
     }
 }
 
@@ -167,5 +168,6 @@ fn format_value(val: &JSValue, machine: &CEKH) -> String {
         JSValue::Object(_) => "[object Object]".to_string(),
         JSValue::Array(_) => "[Array]".to_string(),
         JSValue::Function(_) | JSValue::Continuation(_, _) => "[Function]".to_string(),
+        JSValue::Handler(_) => "[Handler]".to_string(),
     }
 }

@@ -17,10 +17,10 @@ use crate::builtins::call_native;
 use crate::cont::{ContArena, ContId, Kont};
 use crate::env::{EnvArena, EnvId};
 use crate::error::{JSError, Result};
-use crate::handler::{HandlerArena, HandlerId};
 use crate::object::{FunctionData, NativeFn, Object, ObjectKind, Property};
 use crate::string_pool::{StrId, StringPool};
 use crate::value::{JSValue, ObjId};
+use crate::{Handler, HandlerArena};
 
 /// Control - what we're currently evaluating
 #[derive(Clone, Debug)]
@@ -47,15 +47,13 @@ pub struct CEKH {
     pub env: EnvId,
     /// Current continuation
     pub cont: ContId,
-    /// Handler stack (for effects - user implements)
-    pub handlers: Vec<HandlerId>,
 
     /// Environment arena
     pub envs: EnvArena,
     /// Continuation arena
     pub conts: ContArena,
     /// Handler arena
-    pub handler_arena: HandlerArena,
+    pub handlers: HandlerArena,
     /// Object arena
     pub objects: Arena<Object>,
     /// String pool
@@ -69,6 +67,7 @@ impl CEKH {
     pub fn new() -> Self {
         let envs = EnvArena::new();
         let conts = ContArena::new();
+        let handlers = HandlerArena::new();
         let env = envs.global();
         let cont = conts.halt();
 
@@ -76,10 +75,9 @@ impl CEKH {
             control: Control::Value(JSValue::Undefined),
             env,
             cont,
-            handlers: Vec::new(),
             envs,
+            handlers,
             conts,
-            handler_arena: HandlerArena::new(),
             objects: Arena::new(),
             strings: StringPool::new(),
             globals: HashMap::new(),
@@ -170,8 +168,33 @@ impl CEKH {
             }
 
             Expr::Unary { op, operand } => {
-                self.control = Control::Expr(operand);
-                self.cont = self.conts.alloc(Kont::UnaryK { op, k: self.cont });
+                // For increment/decrement on identifiers, we need to update the variable
+                let is_update = matches!(
+                    op,
+                    UnaryOp::PreInc | UnaryOp::PostInc | UnaryOp::PreDec | UnaryOp::PostDec
+                );
+                if is_update {
+                    if let Some(Expr::Identifier(name)) = ast.get_expr(operand) {
+                        // Read current value, then use UpdateVarK to update and return
+                        self.control = Control::Expr(operand);
+                        let is_pre = matches!(op, UnaryOp::PreInc | UnaryOp::PreDec);
+                        let is_inc = matches!(op, UnaryOp::PreInc | UnaryOp::PostInc);
+                        self.cont = self.conts.alloc(Kont::UpdateVarK {
+                            name,
+                            is_pre,
+                            is_inc,
+                            env: self.env,
+                            k: self.cont,
+                        });
+                    } else {
+                        // Non-identifier operand - just evaluate and apply (no side effect)
+                        self.control = Control::Expr(operand);
+                        self.cont = self.conts.alloc(Kont::UnaryK { op, k: self.cont });
+                    }
+                } else {
+                    self.control = Control::Expr(operand);
+                    self.cont = self.conts.alloc(Kont::UnaryK { op, k: self.cont });
+                }
             }
 
             Expr::Binary { op, left, right } => {
@@ -454,6 +477,32 @@ impl CEKH {
                     k: self.cont,
                 });
                 self.control = Control::Expr(body);
+            }
+
+            Expr::Handler {
+                clauses_start,
+                clauses_count,
+                return_param,
+                return_body,
+            } => {
+                let handler = Handler::new(
+                    clauses_start,
+                    clauses_count,
+                    return_param,
+                    return_body,
+                    self.env,
+                );
+                let handler_id = self.handlers.alloc(handler);
+                self.control = Control::Value(JSValue::Handler(handler_id));
+            }
+
+            Expr::HandleWith { body, handler } => {
+                self.control = Control::Expr(handler);
+                self.cont = self.conts.alloc(Kont::HandleWithK {
+                    body,
+                    env: self.env,
+                    k: self.cont,
+                });
             }
         }
 
@@ -768,6 +817,30 @@ impl CEKH {
                 self.cont = k;
             }
 
+            Kont::UpdateVarK {
+                name,
+                is_pre,
+                is_inc,
+                env,
+                k,
+            } => {
+                // val is the current value of the variable
+                let old_val = val;
+                let n = self.to_number(old_val);
+                let new_n = if is_inc { n + 1.0 } else { n - 1.0 };
+                let new_val = self.number_value(new_n);
+
+                // Update the variable
+                if !self.envs.assign(env, name, new_val) {
+                    self.globals.insert(name, new_val);
+                }
+
+                // Return old (post) or new (pre) value
+                let result = if is_pre { new_val } else { old_val };
+                self.control = Control::Value(result);
+                self.cont = k;
+            }
+
             Kont::AssignMemberObjK {
                 property,
                 value,
@@ -1032,6 +1105,28 @@ impl CEKH {
                 }
             }
 
+            Kont::HandleWithK { body, env, k } => {
+                let JSValue::Handler(handler_id) = val else {
+                    return Err(JSError::syntax_error("Expected handler"));
+                };
+
+                let handler = self
+                    .handlers
+                    .get(handler_id)
+                    .ok_or(JSError::runtime_error("Invalid handler"))?;
+
+                self.control = Control::Expr(body);
+                self.env = env;
+                self.cont = self.conts.alloc(Kont::HandlerK {
+                    clauses_start: handler.clauses_start,
+                    clauses_count: handler.clauses_count,
+                    env: handler.env,
+                    return_param: handler.return_param,
+                    return_body: handler.return_body,
+                    k,
+                });
+            }
+
             Kont::ReturnK { env, k } => {
                 self.env = env;
                 self.cont = k;
@@ -1233,9 +1328,24 @@ impl CEKH {
                 self.try_match_arms(val, arms_start, arms_idx, arms_count, env, k, ast)?;
             }
 
-            Kont::HandlerK { k, .. } => {
-                self.control = Control::Value(val);
-                self.cont = k;
+            Kont::HandlerK {
+                return_body,
+                return_param,
+                env,
+                k,
+                ..
+            } => {
+                // Apply the return clause if present
+                if return_body.is_some() {
+                    // Bind the return parameter and evaluate return_body
+                    let return_env = self.envs.bind(env, return_param, val);
+                    self.control = Control::Expr(return_body);
+                    self.env = return_env;
+                    self.cont = k;
+                } else {
+                    self.control = Control::Value(val);
+                    self.cont = k;
+                }
             }
 
             Kont::PerformArgsK {
@@ -1521,7 +1631,11 @@ impl CEKH {
             JSValue::Continuation(cont_id, env_id) => {
                 let value = args.first().copied().unwrap_or(JSValue::Undefined);
 
-                self.cont = cont_id;
+                // Rebase the captured continuation so that when it reaches
+                // the HandlerK, it returns to our current continuation (k)
+                // instead of continuing past the handler.
+                let rebased_cont = self.rebase_continuation(cont_id, k);
+                self.cont = rebased_cont;
                 self.env = env_id;
                 self.control = Control::Value(value);
                 return Ok(());
@@ -1601,6 +1715,7 @@ impl CEKH {
                     JSValue::String(_) => "string",
                     JSValue::Object(_) | JSValue::Array(_) => "object",
                     JSValue::Function(_) | JSValue::Continuation(_, _) => "function",
+                    JSValue::Handler(_) => "handler",
                 };
                 let str_id = self.strings.intern(type_str);
                 Ok(JSValue::String(str_id))
@@ -1834,7 +1949,8 @@ impl CEKH {
             JSValue::Object(_)
             | JSValue::Array(_)
             | JSValue::Function(_)
-            | JSValue::Continuation(_, _) => true,
+            | JSValue::Continuation(_, _)
+            | JSValue::Handler(_) => true,
         }
     }
 
@@ -1887,7 +2003,8 @@ impl CEKH {
             JSValue::Object(_) => "[object Object]".to_string(),
             JSValue::Array(_) => "[object Array]".to_string(),
             JSValue::Function(_) => "[object Function]".to_string(),
-            JSValue::Continuation(_, _) => "[object Continuation]".to_string(),
+            JSValue::Continuation(_, _) => "[cont Continuation]".to_string(),
+            JSValue::Handler(_) => "[handler Handler]".to_string(),
         }
     }
 
@@ -1904,6 +2021,8 @@ impl CEKH {
             (JSValue::Object(a), JSValue::Object(b)) => a == b,
             (JSValue::Array(a), JSValue::Array(b)) => a == b,
             (JSValue::Function(a), JSValue::Function(b)) => a == b,
+            (JSValue::Continuation(a, _), JSValue::Continuation(b, _)) => a == b,
+            (JSValue::Handler(a), JSValue::Handler(b)) => a == b,
             _ => false,
         }
     }
@@ -1935,8 +2054,7 @@ impl CEKH {
                 let match_env = self.envs.extend_with(env, bindings);
 
                 if arm.guard.is_some() {
-                    // Need to evaluate guard - set up continuation to check result
-                    // For now, skip guards (TODO: implement guard evaluation)
+                    // TODO: Handle guards
                     self.env = match_env;
                     self.control = Control::Expr(arm.body);
                     self.cont = k;
@@ -2131,6 +2249,426 @@ impl CEKH {
             }
             _ => Ok(false),
         }
+    }
+
+    /// Rebase a captured continuation so that when it reaches the HandlerK,
+    /// it returns to `new_return_k` after applying the return clause.
+    /// This implements proper delimited continuation semantics for resume:
+    /// - The resumed value flows through the continuation up to the handler
+    /// - The handler's return clause transforms the value
+    /// - Then the transformed value returns to the resume call site
+    fn rebase_continuation(&mut self, cont: ContId, new_return_k: ContId) -> ContId {
+        // Walk the continuation chain and rebuild it with HandlerK's k replaced
+        let mut stack = Vec::new();
+        let mut current = cont;
+
+        // Collect continuations until we find HandlerK
+        loop {
+            let Some(kont) = self.conts.get(current).cloned() else {
+                break;
+            };
+
+            match &kont {
+                Kont::Halt => {
+                    // No handler found, just return original
+                    // (shouldn't happen in well-formed code)
+                    return cont;
+                }
+                Kont::HandlerK {
+                    clauses_start,
+                    clauses_count,
+                    env,
+                    return_body,
+                    return_param,
+                    k: _,
+                } => {
+                    // Found the handler - rebuild with k pointing to resume call site
+                    let new_handler = Kont::HandlerK {
+                        clauses_start: *clauses_start,
+                        clauses_count: *clauses_count,
+                        env: *env,
+                        return_body: *return_body,
+                        return_param: *return_param,
+                        k: new_return_k,
+                    };
+                    let mut result = self.conts.alloc(new_handler);
+
+                    // Rebuild the stack in reverse order
+                    while let Some(k) = stack.pop() {
+                        result = self.rebuild_kont_with_k(k, result);
+                    }
+
+                    return result;
+                }
+                _ => {
+                    stack.push(kont.clone());
+                    current = kont.outer().unwrap_or(self.conts.halt());
+                }
+            }
+        }
+
+        // No handler found, return original
+        cont
+    }
+
+    /// Rebuild a continuation with a new outer continuation k
+    fn rebuild_kont_with_k(&mut self, kont: Kont, new_k: ContId) -> ContId {
+        let new_kont = match kont {
+            Kont::Halt => Kont::Halt,
+            Kont::UnaryK { op, .. } => Kont::UnaryK { op, k: new_k },
+            Kont::BinaryLeftK { op, right, env, .. } => Kont::BinaryLeftK {
+                op,
+                right,
+                env,
+                k: new_k,
+            },
+            Kont::BinaryRightK { op, left, .. } => Kont::BinaryRightK { op, left, k: new_k },
+            Kont::AndK { right, env, .. } => Kont::AndK {
+                right,
+                env,
+                k: new_k,
+            },
+            Kont::OrK { right, env, .. } => Kont::OrK {
+                right,
+                env,
+                k: new_k,
+            },
+            Kont::NullishK { right, env, .. } => Kont::NullishK {
+                right,
+                env,
+                k: new_k,
+            },
+            Kont::MemberK { property, .. } => Kont::MemberK { property, k: new_k },
+            Kont::IndexObjK { index, env, .. } => Kont::IndexObjK {
+                index,
+                env,
+                k: new_k,
+            },
+            Kont::IndexKeyK { obj, .. } => Kont::IndexKeyK { obj, k: new_k },
+            Kont::AssignVarK { name, env, .. } => Kont::AssignVarK {
+                name,
+                env,
+                k: new_k,
+            },
+            Kont::UpdateVarK {
+                name,
+                is_pre,
+                is_inc,
+                env,
+                ..
+            } => Kont::UpdateVarK {
+                name,
+                is_pre,
+                is_inc,
+                env,
+                k: new_k,
+            },
+            Kont::AssignMemberObjK {
+                property,
+                value,
+                env,
+                ..
+            } => Kont::AssignMemberObjK {
+                property,
+                value,
+                env,
+                k: new_k,
+            },
+            Kont::AssignMemberValK { obj, property, .. } => Kont::AssignMemberValK {
+                obj,
+                property,
+                k: new_k,
+            },
+            Kont::AssignIndexObjK {
+                index, value, env, ..
+            } => Kont::AssignIndexObjK {
+                index,
+                value,
+                env,
+                k: new_k,
+            },
+            Kont::AssignIndexKeyK {
+                obj, value, env, ..
+            } => Kont::AssignIndexKeyK {
+                obj,
+                value,
+                env,
+                k: new_k,
+            },
+            Kont::AssignIndexValK { obj, key, .. } => Kont::AssignIndexValK { obj, key, k: new_k },
+            Kont::IfK {
+                consequent,
+                alternate,
+                env,
+                ..
+            } => Kont::IfK {
+                consequent,
+                alternate,
+                env,
+                k: new_k,
+            },
+            Kont::CondK {
+                consequent,
+                alternate,
+                env,
+                ..
+            } => Kont::CondK {
+                consequent,
+                alternate,
+                env,
+                k: new_k,
+            },
+            Kont::WhileK {
+                test, body, env, ..
+            } => Kont::WhileK {
+                test,
+                body,
+                env,
+                k: new_k,
+            },
+            Kont::WhileBodyK {
+                test, body, env, ..
+            } => Kont::WhileBodyK {
+                test,
+                body,
+                env,
+                k: new_k,
+            },
+            Kont::ForTestK {
+                test,
+                update,
+                body,
+                env,
+                ..
+            } => Kont::ForTestK {
+                test,
+                update,
+                body,
+                env,
+                k: new_k,
+            },
+            Kont::ForTestResultK {
+                test,
+                update,
+                body,
+                env,
+                ..
+            } => Kont::ForTestResultK {
+                test,
+                update,
+                body,
+                env,
+                k: new_k,
+            },
+            Kont::ForBodyK {
+                test,
+                update,
+                body,
+                env,
+                ..
+            } => Kont::ForBodyK {
+                test,
+                update,
+                body,
+                env,
+                k: new_k,
+            },
+            Kont::ForUpdateK {
+                test,
+                update,
+                body,
+                env,
+                ..
+            } => Kont::ForUpdateK {
+                test,
+                update,
+                body,
+                env,
+                k: new_k,
+            },
+            Kont::CalleeK {
+                args_start,
+                args_count,
+                env,
+                ..
+            } => Kont::CalleeK {
+                args_start,
+                args_count,
+                env,
+                k: new_k,
+            },
+            Kont::ArgsK {
+                callee,
+                done,
+                args_start,
+                args_idx,
+                args_count,
+                env,
+                ..
+            } => Kont::ArgsK {
+                callee,
+                done,
+                args_start,
+                args_idx,
+                args_count,
+                env,
+                k: new_k,
+            },
+            Kont::ReturnK { env, .. } => Kont::ReturnK { env, k: new_k },
+            Kont::ReturnExprK { .. } => Kont::ReturnExprK { k: new_k },
+            Kont::ArrayK {
+                done,
+                elems_start,
+                elems_idx,
+                elems_count,
+                env,
+                ..
+            } => Kont::ArrayK {
+                done,
+                elems_start,
+                elems_idx,
+                elems_count,
+                env,
+                k: new_k,
+            },
+            Kont::ObjectK {
+                done,
+                props_start,
+                props_idx,
+                props_count,
+                env,
+                ..
+            } => Kont::ObjectK {
+                done,
+                props_start,
+                props_idx,
+                props_count,
+                env,
+                k: new_k,
+            },
+            Kont::LetK { name, env, .. } => Kont::LetK {
+                name,
+                env,
+                k: new_k,
+            },
+            Kont::ConstK { name, env, .. } => Kont::ConstK {
+                name,
+                env,
+                k: new_k,
+            },
+            Kont::VarK { name, env, .. } => Kont::VarK {
+                name,
+                env,
+                k: new_k,
+            },
+            Kont::SeqK {
+                stmts_start,
+                stmts_idx,
+                stmts_count,
+                env,
+                ..
+            } => Kont::SeqK {
+                stmts_start,
+                stmts_idx,
+                stmts_count,
+                env,
+                k: new_k,
+            },
+            Kont::ExprStmtK { .. } => Kont::ExprStmtK { k: new_k },
+            Kont::TryK {
+                catch_param,
+                catch_body,
+                finally_body,
+                env,
+                ..
+            } => Kont::TryK {
+                catch_param,
+                catch_body,
+                finally_body,
+                env,
+                k: new_k,
+            },
+            Kont::FinallyK {
+                finally_body,
+                result,
+                thrown,
+                env,
+                ..
+            } => Kont::FinallyK {
+                finally_body,
+                result,
+                thrown,
+                env,
+                k: new_k,
+            },
+            Kont::ThrowK { .. } => Kont::ThrowK { k: new_k },
+            Kont::BlockK {
+                stmts_start,
+                stmts_idx,
+                stmts_count,
+                final_expr,
+                env,
+                ..
+            } => Kont::BlockK {
+                stmts_start,
+                stmts_idx,
+                stmts_count,
+                final_expr,
+                env,
+                k: new_k,
+            },
+            Kont::MatchK {
+                arms_start,
+                arms_idx,
+                arms_count,
+                env,
+                ..
+            } => Kont::MatchK {
+                arms_start,
+                arms_idx,
+                arms_count,
+                env,
+                k: new_k,
+            },
+            Kont::HandlerK {
+                clauses_start,
+                clauses_count,
+                env,
+                return_body,
+                return_param,
+                ..
+            } => Kont::HandlerK {
+                clauses_start,
+                clauses_count,
+                env,
+                return_body,
+                return_param,
+                k: new_k,
+            },
+            Kont::PerformArgsK {
+                effect,
+                done,
+                args_start,
+                args_idx,
+                args_count,
+                env,
+                ..
+            } => Kont::PerformArgsK {
+                effect,
+                done,
+                args_start,
+                args_idx,
+                args_count,
+                env,
+                k: new_k,
+            },
+            Kont::HandleWithK { body, env, .. } => Kont::HandleWithK {
+                body,
+                env,
+                k: new_k,
+            },
+        };
+        self.conts.alloc(new_kont)
     }
 
     fn setup_builtins(&mut self) {

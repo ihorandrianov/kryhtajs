@@ -746,6 +746,7 @@ impl<'a> Parser<'a> {
             }
             Token::Match => self.parse_match_expr(),
             Token::Perform => self.parse_perform_expr(),
+            Token::Handler => self.parse_handler_expr(),
             Token::Handle => self.parse_handle_expr(),
             Token::Do => self.parse_block_expr(),
             _ => Err(JSError::syntax(
@@ -984,14 +985,13 @@ impl<'a> Parser<'a> {
 
             Token::LBracket => {
                 self.advance()?;
-                let elems_start = self.arena.start_pattern_list();
-                let mut elems_count = 0u16;
+                // Collect elements in temp vec to avoid nested patterns corrupting indices
+                let mut elems = Vec::new();
 
                 if !self.check(&Token::RBracket) {
                     loop {
                         let elem_pat = self.parse_pattern()?;
-                        self.arena.push_pattern_list(elem_pat);
-                        elems_count += 1;
+                        elems.push(elem_pat);
                         if !self.check(&Token::Comma) {
                             break;
                         }
@@ -999,6 +999,12 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.consume(Token::RBracket)?;
+
+                let elems_start = self.arena.start_pattern_list();
+                let elems_count = elems.len() as u16;
+                for elem in elems {
+                    self.arena.push_pattern_list(elem);
+                }
 
                 Ok(self.arena.alloc_pattern(Pattern::Array {
                     elems_start,
@@ -1008,8 +1014,8 @@ impl<'a> Parser<'a> {
 
             Token::LBrace => {
                 self.advance()?;
-                let fields_start = self.arena.start_pattern_field_list();
-                let mut fields_count = 0u16;
+                // Collect fields in temp vec to avoid nested patterns corrupting indices
+                let mut fields = Vec::new();
 
                 if !self.check(&Token::RBrace) {
                     loop {
@@ -1040,8 +1046,7 @@ impl<'a> Parser<'a> {
                             self.arena.alloc_pattern(Pattern::Var(key))
                         };
 
-                        self.arena.push_pattern_field(key, pattern);
-                        fields_count += 1;
+                        fields.push((key, pattern));
 
                         if !self.check(&Token::Comma) {
                             break;
@@ -1050,6 +1055,12 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.consume(Token::RBrace)?;
+
+                let fields_start = self.arena.start_pattern_field_list();
+                let fields_count = fields.len() as u16;
+                for (key, pattern) in fields {
+                    self.arena.push_pattern_field(key, pattern);
+                }
 
                 Ok(self.arena.alloc_pattern(Pattern::Object {
                     fields_start,
@@ -1114,12 +1125,18 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    /// Parse: handle { body } with { effect_clauses }
-    fn parse_handle_expr(&mut self) -> Result<ExprId> {
-        let body = self.parse_block_expr()?;
+    fn parse_handler_expr(&mut self) -> Result<ExprId> {
+        let (clauses_start, clauses_count, return_param, return_body) =
+            self.parse_handler_clauses()?;
+        Ok(self.arena.alloc_expr(Expr::Handler {
+            clauses_start,
+            clauses_count,
+            return_param,
+            return_body,
+        }))
+    }
 
-        self.consume(Token::With)?;
-
+    fn parse_handler_clauses(&mut self) -> Result<(u32, u16, StrId, ExprId)> {
         self.consume(Token::LBrace)?;
 
         let clauses_start = self.arena.start_effect_clause_list();
@@ -1219,12 +1236,29 @@ impl<'a> Parser<'a> {
 
         self.consume(Token::RBrace)?;
 
-        Ok(self.arena.alloc_expr(Expr::Handle {
-            body,
-            clauses_start,
-            clauses_count,
-            return_param,
-            return_body,
-        }))
+        return Ok((clauses_start, clauses_count, return_param, return_body));
+    }
+
+    /// Parse: handle { body } with { effect_clauses }
+    fn parse_handle_expr(&mut self) -> Result<ExprId> {
+        let body = self.parse_block_expr()?;
+
+        self.consume(Token::With)?;
+
+        if self.check(&Token::LBrace) {
+            let (clauses_start, clauses_count, return_param, return_body) =
+                self.parse_handler_clauses()?;
+            Ok(self.arena.alloc_expr(Expr::Handle {
+                body,
+                clauses_start,
+                clauses_count,
+                return_param,
+                return_body,
+            }))
+        } else {
+            // Use parse_call to avoid consuming binary operators like ===
+            let handler = self.parse_call()?;
+            Ok(self.arena.alloc_expr(Expr::HandleWith { body, handler }))
+        }
     }
 }

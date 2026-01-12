@@ -202,6 +202,12 @@ pub enum Expr {
         params_count: u16,
         body: StmtId,
     },
+    Handler {
+        clauses_start: u32,
+        clauses_count: u16,
+        return_param: StrId, // parameter name for return clause (StrId::NONE if no return)
+        return_body: ExprId, // ExprId::NONE if no return clause
+    },
     Arrow {
         params_start: u32,
         params_count: u16,
@@ -235,6 +241,10 @@ pub enum Expr {
         clauses_count: u16,
         return_param: StrId, // parameter name for return clause (StrId::NONE if no return)
         return_body: ExprId, // ExprId::NONE if no return clause
+    },
+    HandleWith {
+        body: ExprId,
+        handler: ExprId,
     },
 }
 

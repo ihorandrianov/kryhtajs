@@ -1,49 +1,36 @@
 //! Handler infrastructure for algebraic effects
 
+use crate::ExprId;
 use crate::arena::{Arena, ArenaId};
-use crate::cont::ContId;
 use crate::env::EnvId;
 use crate::string_pool::StrId;
-use crate::value::ObjId;
 
 pub type HandlerId = ArenaId<Handler>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Handler {
-    pub effect_name: StrId,
-    pub handler_fn: ObjId,
-    pub return_fn: Option<ObjId>,
+    pub clauses_start: u32,
+    pub clauses_count: u16,
+    pub return_param: StrId,
+    pub return_body: ExprId,
     pub env: EnvId,
-    pub delimiter: ContId,
 }
 
 impl Handler {
     pub fn new(
-        effect_name: StrId,
-        handler_fn: ObjId,
-        return_fn: Option<ObjId>,
+        clauses_start: u32,
+        clauses_count: u16,
+        return_param: StrId,
+        return_body: ExprId,
         env: EnvId,
-        delimiter: ContId,
     ) -> Self {
         Self {
-            effect_name,
-            handler_fn,
-            return_fn,
+            clauses_start,
+            clauses_count,
+            return_param,
+            return_body,
             env,
-            delimiter,
         }
-    }
-}
-
-#[derive(Clone)]
-pub struct CapturedCont {
-    pub cont: ContId,
-    pub env: EnvId,
-}
-
-impl CapturedCont {
-    pub fn new(cont: ContId, env: EnvId) -> Self {
-        Self { cont, env }
     }
 }
 
