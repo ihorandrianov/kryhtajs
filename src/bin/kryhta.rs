@@ -1,9 +1,9 @@
 //! KryhtaJS REPL and CLI
 //!
-//! Uses CEKH machine for direct AST interpretation.
+//! Uses Runtime with CEKH machine for direct AST interpretation.
 
 use kryhta::parser::Parser;
-use kryhta::{CEKH, JSError, JSValue, Result};
+use kryhta::{Runtime, JSError, JSValue, Result};
 
 use std::io::{self, BufRead, Write};
 
@@ -22,11 +22,11 @@ fn main() -> Result<()> {
 }
 
 fn repl() -> Result<()> {
-    println!("KryhtaJS v0.2.0 — крихта (CEKH)");
+    println!("KryhtaJS v0.2.0 — крихта (Runtime)");
     println!("Type 'exit' or Ctrl+D to quit\n");
 
     let stdin = io::stdin();
-    let mut machine = CEKH::new();
+    let mut runtime = Runtime::new();
 
     loop {
         print!("> ");
@@ -44,9 +44,9 @@ fn repl() -> Result<()> {
                     continue;
                 }
 
-                match eval_line(&mut machine, line) {
+                match eval_line(&mut runtime, line) {
                     Ok(result) => {
-                        print_value(&result, &machine);
+                        print_value(&result, &runtime);
                     }
                     Err(e) => eprintln!("Error: {}", e),
                 }
@@ -62,23 +62,21 @@ fn repl() -> Result<()> {
     Ok(())
 }
 
-fn eval_line(machine: &mut CEKH, source: &str) -> Result<JSValue> {
-    // Parse source to AST using machine's string pool
-    // This ensures StrIds in AST match machine's pool
-    let strings = std::mem::take(&mut machine.strings);
+fn eval_line(runtime: &mut Runtime, source: &str) -> Result<JSValue> {
+    let strings = std::mem::take(&mut runtime.interpreter.strings);
     let parser = Parser::with_strings(source, strings)?;
     let (arena, strings) = parser.parse_program()?;
-    machine.strings = strings;
+    runtime.interpreter.strings = strings;
 
-    machine.run(&arena)
+    runtime.run(&arena)
 }
 
 fn run(source: &str) -> Result<()> {
-    let mut machine = CEKH::new();
-    match eval_line(&mut machine, source) {
+    let mut runtime = Runtime::new();
+    match eval_line(&mut runtime, source) {
         Ok(result) => {
             if !matches!(result, JSValue::Undefined) {
-                print_value(&result, &machine);
+                print_value(&result, &runtime);
             }
         }
         Err(e) => {
@@ -89,7 +87,7 @@ fn run(source: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_value(val: &JSValue, machine: &CEKH) {
+fn print_value(val: &JSValue, runtime: &Runtime) {
     match val {
         JSValue::Undefined => println!("undefined"),
         JSValue::Null => println!("null"),
@@ -111,7 +109,7 @@ fn print_value(val: &JSValue, machine: &CEKH) {
             }
         }
         JSValue::String(str_id) => {
-            if let Some(s) = machine.strings.get(*str_id) {
+            if let Some(s) = runtime.interpreter.strings.get(*str_id) {
                 println!("'{}'", s);
             } else {
                 println!("<invalid string>");
@@ -119,12 +117,12 @@ fn print_value(val: &JSValue, machine: &CEKH) {
         }
         JSValue::Object(_) => println!("[object Object]"),
         JSValue::Array(id) => {
-            if let Some(obj) = machine.objects.get(id.into_arena_id()) {
+            if let Some(obj) = runtime.interpreter.objects.get(id.into_arena_id()) {
                 if let Some(arr) = obj.as_array() {
                     let parts: Vec<String> = arr
                         .elements
                         .iter()
-                        .map(|v| format_value(v, machine))
+                        .map(|v| format_value(v, runtime))
                         .collect();
                     println!("[{}]", parts.join(", "));
                 } else {
@@ -139,7 +137,7 @@ fn print_value(val: &JSValue, machine: &CEKH) {
     }
 }
 
-fn format_value(val: &JSValue, machine: &CEKH) -> String {
+fn format_value(val: &JSValue, runtime: &Runtime) -> String {
     match val {
         JSValue::Undefined => "undefined".to_string(),
         JSValue::Null => "null".to_string(),
@@ -159,7 +157,7 @@ fn format_value(val: &JSValue, machine: &CEKH) -> String {
             }
         }
         JSValue::String(str_id) => {
-            if let Some(s) = machine.strings.get(*str_id) {
+            if let Some(s) = runtime.interpreter.strings.get(*str_id) {
                 format!("'{}'", s)
             } else {
                 "<invalid>".to_string()

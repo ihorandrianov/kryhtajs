@@ -33,3 +33,4 @@ pub use error::{JSError, Result};
 pub use handler::{Handler, HandlerArena, HandlerId};
 pub use string_pool::{StrId, StringPool};
 pub use value::{JSValue, ObjId};
+pub use runtime::Runtime;

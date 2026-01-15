@@ -2251,28 +2251,6 @@ impl CEKH {
         }
     }
 
-    fn try_native_effect(&mut self, effect: StrId, args: &[JSValue]) -> Result<bool> {
-        let effect_name = self.strings.get(effect).unwrap_or("");
-
-        match effect_name {
-            "Print" => {
-                let output: Vec<String> =
-                    args.into_iter().map(|arg| self.to_string(*arg)).collect();
-                let msg = output.join(" ");
-
-                #[cfg(feature = "wasm")]
-                web_sys::console::log_1(&msg.into());
-
-                #[cfg(not(feature = "wasm"))]
-                println!("{}", msg);
-
-                self.control = Control::Value(JSValue::Undefined);
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
     /// Rebase a captured continuation so that when it reaches the HandlerK,
     /// it returns to `new_return_k` after applying the return clause.
     /// This implements proper delimited continuation semantics for resume:
