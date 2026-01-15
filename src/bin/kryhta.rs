@@ -3,7 +3,7 @@
 //! Uses Runtime with CEKH machine for direct AST interpretation.
 
 use kryhta::parser::Parser;
-use kryhta::{Runtime, JSError, JSValue, Result};
+use kryhta::{JSError, JSValue, Result, Runtime};
 
 use std::io::{self, BufRead, Write};
 

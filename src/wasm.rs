@@ -4,8 +4,8 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::parser::Parser;
 use crate::CEKH;
+use crate::parser::Parser;
 
 #[wasm_bindgen]
 pub fn evaluate(source: &str) -> String {
