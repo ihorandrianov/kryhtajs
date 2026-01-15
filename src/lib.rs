@@ -5,6 +5,9 @@
 //! This engine uses a CEKH machine (Control, Environment, Kontinuation, Handlers)
 //! for evaluation. The H component provides infrastructure for algebraic effects.
 
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
 pub mod arena;
 pub mod ast;
 pub mod builtins;
@@ -17,6 +20,7 @@ pub mod handler;
 pub mod lexer;
 pub mod object;
 pub mod parser;
+pub mod runtime;
 pub mod string_pool;
 pub mod value;
 

@@ -18,6 +18,7 @@ use crate::cont::{ContArena, ContId, Kont};
 use crate::env::{EnvArena, EnvId};
 use crate::error::{JSError, Result};
 use crate::object::{FunctionData, NativeFn, Object, ObjectKind, Property};
+use crate::runtime::Outcome;
 use crate::string_pool::{StrId, StringPool};
 use crate::value::{JSValue, ObjId};
 use crate::{Handler, HandlerArena};
@@ -37,6 +38,8 @@ pub enum Control {
     Throwing(JSValue),
     /// Halted - execution complete
     Halted(JSValue),
+    /// Suspend - user space effect found
+    Suspend { effect: StrId, args: Vec<JSValue> },
 }
 
 /// The CEKH machine state
@@ -87,7 +90,7 @@ impl CEKH {
         machine
     }
 
-    pub fn run(&mut self, ast: &AstArena) -> Result<JSValue> {
+    pub fn fresh_exec_setup(&mut self, ast: &AstArena) -> Result<JSValue> {
         let stmts = ast.get_stmt_list(ast.root_start, ast.root_count);
         if stmts.is_empty() {
             return Ok(JSValue::Undefined);
@@ -107,9 +110,22 @@ impl CEKH {
             self.conts.halt()
         };
 
+        Ok(JSValue::Null)
+    }
+
+    pub fn run(&mut self, ast: &AstArena) -> Result<Outcome> {
         loop {
-            match &self.control {
-                Control::Halted(val) => return Ok(*val),
+            match self.control {
+                Control::Halted(val) => return Ok(Outcome::Done(val)),
+                Control::Suspend {
+                    effect,
+                    ref mut args,
+                } => {
+                    return Ok(Outcome::Suspended {
+                        effect: effect,
+                        args: std::mem::take(args),
+                    });
+                }
                 _ => self.step(ast)?,
             }
         }
@@ -123,6 +139,7 @@ impl CEKH {
             Control::Returning(val) => self.handle_return(val, ast),
             Control::Throwing(val) => self.handle_throw(val, ast),
             Control::Halted(_) => Ok(()),
+            Control::Suspend { .. } => Ok(()),
         }
     }
 
@@ -1979,7 +1996,7 @@ impl CEKH {
         }
     }
 
-    fn to_string(&self, val: JSValue) -> String {
+    pub fn to_string(&self, val: JSValue) -> String {
         match val {
             JSValue::Undefined => "undefined".to_string(),
             JSValue::Null => "null".to_string(),
@@ -2192,10 +2209,8 @@ impl CEKH {
             if let Some(kont) = self.conts.get(k).cloned() {
                 match kont {
                     Kont::Halt => {
-                        if self.try_native_effect(effect, &args)? {
-                            return Ok(());
-                        }
-                        return Err(JSError::runtime_error("Unhandled effect!"));
+                        self.control = Control::Suspend { effect, args };
+                        return Ok(());
                     }
                     Kont::HandlerK {
                         clauses_start,
@@ -2243,7 +2258,14 @@ impl CEKH {
             "Print" => {
                 let output: Vec<String> =
                     args.into_iter().map(|arg| self.to_string(*arg)).collect();
-                println!("{}", output.join(" "));
+                let msg = output.join(" ");
+
+                #[cfg(feature = "wasm")]
+                web_sys::console::log_1(&msg.into());
+
+                #[cfg(not(feature = "wasm"))]
+                println!("{}", msg);
+
                 self.control = Control::Value(JSValue::Undefined);
                 Ok(true)
             }

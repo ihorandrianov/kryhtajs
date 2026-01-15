@@ -10,12 +10,19 @@ categories = ["parser-implementations"]
 [lib]
 name = "kryhta"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "kryhta"
 path = "src/bin/kryhta.rs"
 
+[features]
+default = []
+wasm = ["wasm-bindgen", "web-sys"]
+
 [dependencies]
+wasm-bindgen = { version = "0.2", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["console"] }
 
 [dev-dependencies]
 
