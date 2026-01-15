@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
 
+use crate::Kont;
 use crate::ast::AstArena;
 use crate::cekh::{CEKH, Control};
 use crate::cont::ContId;
 use crate::env::EnvId;
 use crate::error::{JSError, Result};
+use crate::object::ObjectKind;
 use crate::string_pool::StrId;
 use crate::value::JSValue;
 
@@ -23,8 +25,11 @@ pub enum FiberStatus {
 #[derive(Debug, Clone)]
 pub struct Fiber {
     pub id: FiberId,
+
+    pub control: Control,
     pub cont: ContId,
     pub env: EnvId,
+
     pub status: FiberStatus,
 }
 
@@ -68,6 +73,7 @@ impl Runtime {
 
         let root_fiber = Fiber {
             id: FiberId(0),
+            control: self.interpreter.control.clone(),
             cont: self.interpreter.cont,
             env: self.interpreter.env,
             status: FiberStatus::Ready,
@@ -95,7 +101,7 @@ impl Runtime {
                     self.current = None;
                 }
                 Outcome::Suspended { effect, args } => {
-                    match self.handle_effect(effect, args)? {
+                    match self.handle_effect(effect, args, ast)? {
                         EffectResult::Resume => {}
                         EffectResult::Block => {
                             // TODO: block current fiber, select next
@@ -124,6 +130,7 @@ impl Runtime {
             "Selected fiber is not Ready"
         );
 
+        self.interpreter.control = fiber.control.clone();
         self.interpreter.cont = fiber.cont;
         self.interpreter.env = fiber.env;
         fiber.status = FiberStatus::Running;
@@ -149,12 +156,12 @@ impl Runtime {
         fiber.status = FiberStatus::Completed(value);
     }
 
-    fn spawn_fiber(&mut self, cont: ContId, env: EnvId) -> FiberId {
-        let id = FiberId(self.next_fiber_id);
-        self.next_fiber_id += 1;
+    fn spawn_fiber(&mut self, cont: ContId, env: EnvId, control: Control) -> FiberId {
+        let id = self.get_next_fiber_id();
 
         let fiber = Fiber {
             id,
+            control,
             cont,
             env,
             status: FiberStatus::Ready,
@@ -165,13 +172,66 @@ impl Runtime {
         id
     }
 
-    fn handle_effect(&mut self, effect: StrId, args: Vec<JSValue>) -> Result<EffectResult> {
+    fn get_next_fiber_id(&mut self) -> FiberId {
+        let id = FiberId(self.next_fiber_id);
+        self.next_fiber_id += 1;
+        id
+    }
+
+    fn handle_effect(
+        &mut self,
+        effect: StrId,
+        args: Vec<JSValue>,
+        ast: &AstArena,
+    ) -> Result<EffectResult> {
         let effect_name = self.interpreter.strings.get(effect).unwrap_or("");
 
         match effect_name {
             "Print" => self.handle_print(args),
+            "Fork" => self.handle_fork(args, ast),
             _ => Err(JSError::runtime_error("Unknown effect")),
         }
+    }
+
+    fn handle_fork(&mut self, args: Vec<JSValue>, _ast: &AstArena) -> Result<EffectResult> {
+        let JSValue::Function(k) = args.first().copied().unwrap_or(JSValue::Undefined) else {
+            return Err(JSError::type_error("Fork: expected function"));
+        };
+
+        let fn_obj = self
+            .interpreter
+            .objects
+            .get(k.into_arena_id())
+            .ok_or(JSError::InternalError("Invalid function object"))?;
+
+        let ObjectKind::Function(func_data) = &fn_obj.kind else {
+            return Err(JSError::type_error("Fork: not a function"));
+        };
+
+        let func_data = func_data.clone();
+
+        let control = if let Some(expr_body) = func_data.expr_body {
+            Control::Expr(expr_body)
+        } else {
+            Control::Stmt(func_data.body)
+        };
+
+        let cont = self.interpreter.conts.alloc(Kont::Halt);
+        let env = func_data.env;
+
+        let id = self.get_next_fiber_id();
+        let fiber = Fiber {
+            id,
+            control,
+            cont,
+            env,
+            status: FiberStatus::Ready,
+        };
+
+        self.fibers.push(fiber);
+        self.ready_queue.push_back(id);
+
+        Ok(EffectResult::Spawned(id))
     }
 
     fn handle_print(&mut self, args: Vec<JSValue>) -> Result<EffectResult> {
