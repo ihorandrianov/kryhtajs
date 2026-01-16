@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::Kont;
 use crate::ast::AstArena;
@@ -53,6 +53,7 @@ pub struct Runtime {
     pub ready_queue: VecDeque<FiberId>,
     pub current: Option<FiberId>,
     next_fiber_id: u32,
+    join_waiters: HashMap<FiberId, Vec<FiberId>>,
     gc: GC,
 }
 
@@ -64,6 +65,7 @@ impl Runtime {
             ready_queue: VecDeque::new(),
             current: None,
             next_fiber_id: 0,
+            join_waiters: HashMap::new(),
             gc: GC::new(),
         }
     }
@@ -154,6 +156,12 @@ impl Runtime {
             .expect("Current fiber should be found");
 
         fiber.status = FiberStatus::Completed(value);
+
+        if let Some(waiters) = self.join_waiters.remove(&fiber_id) {
+            for waiter_id in waiters {
+                self.unblock_fiber(waiter_id, value);
+            }
+        }
     }
 
     fn spawn_fiber(&mut self, cont: ContId, env: EnvId, control: Control) -> FiberId {
@@ -193,6 +201,7 @@ impl Runtime {
         match effect_name {
             "Print" => self.handle_print(args),
             "Fork" => self.handle_fork(args, ast),
+            "Join" => self.handle_join(args),
             _ => Err(JSError::runtime_error("Unknown effect")),
         }
     }
@@ -238,6 +247,53 @@ impl Runtime {
         Ok(EffectResult::Spawned(id))
     }
 
+    fn handle_join(&mut self, args: Vec<JSValue>) -> Result<EffectResult> {
+        let JSValue::Int(id) = args.first().copied().unwrap_or(JSValue::Undefined) else {
+            return Err(JSError::type_error("Join: expected fiber id"));
+        };
+
+        let target_id = FiberId(id as u32);
+        let current_id = self.current.expect("No current fiber");
+
+        let target = self
+            .fibers
+            .iter()
+            .find(|f| f.id == target_id)
+            .ok_or(JSError::runtime_error("Join: fiber not found"))?;
+
+        match &target.status {
+            FiberStatus::Completed(value) => {
+                let value = *value;
+                self.interpreter.control = Control::Value(value);
+                Ok(EffectResult::Resume)
+            }
+            FiberStatus::Failed(err) => Err(err.clone()),
+            _ => {
+                self.join_waiters
+                    .entry(target_id)
+                    .or_default()
+                    .push(current_id);
+
+                self.save_current_fiber_state();
+                Ok(EffectResult::Block)
+            }
+        }
+    }
+
+    fn save_current_fiber_state(&mut self) {
+        let fiber_id = self.current.expect("No current fiber");
+        let fiber = self
+            .fibers
+            .iter_mut()
+            .find(|f| f.id == fiber_id)
+            .expect("Current fiber not found");
+
+        fiber.control = self.interpreter.control.clone();
+        fiber.cont = self.interpreter.cont;
+        fiber.env = self.interpreter.env;
+        fiber.status = FiberStatus::Ready;
+    }
+
     fn handle_print(&mut self, args: Vec<JSValue>) -> Result<EffectResult> {
         let output: Vec<String> = args
             .iter()
@@ -281,16 +337,12 @@ impl Runtime {
         fiber.status = FiberStatus::Blocked { effect, args };
     }
 
-    fn unblock_fiber(&mut self, fiber_id: FiberId, _value: JSValue) {
+    fn unblock_fiber(&mut self, fiber_id: FiberId, value: JSValue) {
         let fiber = self.fibers.iter_mut().find(|f| f.id == fiber_id);
         assert!(fiber.is_some(), "Fiber to unblock not found");
         let fiber = fiber.unwrap();
 
-        assert!(
-            matches!(fiber.status, FiberStatus::Blocked { .. }),
-            "Fiber to unblock is not Blocked"
-        );
-
+        fiber.control = Control::Value(value);
         fiber.status = FiberStatus::Ready;
         self.ready_queue.push_back(fiber_id);
     }
