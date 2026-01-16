@@ -427,6 +427,12 @@ impl Kont {
     }
 }
 
+impl Default for Kont {
+    fn default() -> Self {
+        Kont::Halt
+    }
+}
+
 /// Continuation arena
 pub struct ContArena {
     arena: Arena<Kont>,
@@ -458,6 +464,11 @@ impl ContArena {
     /// Get mutable continuation
     pub fn get_mut(&mut self, id: ContId) -> Option<&mut Kont> {
         self.arena.get_mut(id)
+    }
+
+    /// Take ownership of continuation (replaces with Halt)
+    pub fn take(&mut self, id: ContId) -> Option<Kont> {
+        self.arena.take(id)
     }
 
     pub fn is_marked(&self, id: ContId) -> bool {

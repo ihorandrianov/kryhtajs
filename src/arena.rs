@@ -85,6 +85,15 @@ impl<T> Arena<T> {
         self.data.get_mut(id.index())
     }
 
+    pub fn take(&mut self, id: ArenaId<T>) -> Option<T>
+    where
+        T: Default,
+    {
+        self.data
+            .get_mut(id.index())
+            .map(|slot| std::mem::take(slot))
+    }
+
     pub fn len(&self) -> usize {
         self.data.len()
     }

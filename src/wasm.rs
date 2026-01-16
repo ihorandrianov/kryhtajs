@@ -4,13 +4,13 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::CEKH;
 use crate::parser::Parser;
+use crate::runtime::Runtime;
 
 #[wasm_bindgen]
 pub fn evaluate(source: &str) -> String {
-    let mut machine = CEKH::new();
-    let strings = std::mem::take(&mut machine.strings);
+    let mut runtime = Runtime::new();
+    let strings = std::mem::take(&mut runtime.interpreter.strings);
 
     let parser = match Parser::with_strings(source, strings) {
         Ok(p) => p,
@@ -22,10 +22,10 @@ pub fn evaluate(source: &str) -> String {
         Err(e) => return format!("Parse error: {}", e),
     };
 
-    machine.strings = strings;
+    runtime.interpreter.strings = strings;
 
-    match machine.run(&arena) {
-        Ok(val) => machine.to_string(val),
+    match runtime.run(&arena) {
+        Ok(val) => runtime.interpreter.to_string(val),
         Err(e) => format!("Error: {}", e),
     }
 }

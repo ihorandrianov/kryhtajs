@@ -132,14 +132,20 @@ impl CEKH {
     }
 
     pub fn step(&mut self, ast: &AstArena) -> Result<()> {
-        match self.control.clone() {
+        match std::mem::replace(&mut self.control, Control::Value(JSValue::Undefined)) {
             Control::Expr(expr_id) => self.step_expr(expr_id, ast),
             Control::Stmt(stmt_id) => self.step_stmt(stmt_id, ast),
             Control::Value(val) => self.apply_cont(val, ast),
             Control::Returning(val) => self.handle_return(val, ast),
             Control::Throwing(val) => self.handle_throw(val, ast),
-            Control::Halted(_) => Ok(()),
-            Control::Suspend { .. } => Ok(()),
+            Control::Halted(val) => {
+                self.control = Control::Halted(val);
+                Ok(())
+            }
+            Control::Suspend { effect, args } => {
+                self.control = Control::Suspend { effect, args };
+                Ok(())
+            }
         }
     }
 
@@ -746,10 +752,11 @@ impl CEKH {
     }
 
     fn apply_cont(&mut self, val: JSValue, ast: &AstArena) -> Result<()> {
+        // Take ownership to avoid cloning. The old continuation slot becomes Halt
+        // (which is fine - we're done with it, and GC will eventually reclaim it).
         let kont = self
             .conts
-            .get(self.cont)
-            .cloned()
+            .take(self.cont)
             .ok_or(JSError::InternalError("Invalid continuation"))?;
 
         match kont {
@@ -1150,7 +1157,8 @@ impl CEKH {
                 self.control = Control::Value(val);
             }
 
-            Kont::ReturnExprK { k: _ } => {
+            Kont::ReturnExprK { k } => {
+                self.cont = k;
                 self.control = Control::Returning(val);
             }
 
@@ -1299,7 +1307,8 @@ impl CEKH {
                 self.cont = k;
             }
 
-            Kont::ThrowK { k: _ } => {
+            Kont::ThrowK { k } => {
+                self.cont = k;
                 self.control = Control::Throwing(val);
             }
 
@@ -1403,28 +1412,27 @@ impl CEKH {
     fn handle_return(&mut self, val: JSValue, _ast: &AstArena) -> Result<()> {
         let mut k = self.cont;
         loop {
-            if let Some(kont) = self.conts.get(k).cloned() {
-                match kont {
-                    Kont::Halt => {
-                        self.control = Control::Halted(val);
-                        return Ok(());
-                    }
-                    Kont::ReturnK { env, k: outer } => {
-                        self.env = env;
-                        self.cont = outer;
-                        self.control = Control::Value(val);
-                        return Ok(());
-                    }
-                    _ => {
-                        if let Some(outer) = kont.outer() {
-                            k = outer;
-                        } else {
-                            break;
-                        }
+            let Some(kont) = self.conts.get(k) else {
+                break;
+            };
+            match kont {
+                Kont::Halt => {
+                    self.control = Control::Halted(val);
+                    return Ok(());
+                }
+                Kont::ReturnK { env, k: outer } => {
+                    self.env = *env;
+                    self.cont = *outer;
+                    self.control = Control::Value(val);
+                    return Ok(());
+                }
+                _ => {
+                    if let Some(outer) = kont.outer() {
+                        k = outer;
+                    } else {
+                        break;
                     }
                 }
-            } else {
-                break;
             }
         }
 
@@ -1435,60 +1443,66 @@ impl CEKH {
     fn handle_throw(&mut self, val: JSValue, _ast: &AstArena) -> Result<()> {
         let mut k = self.cont;
         loop {
-            if let Some(kont) = self.conts.get(k).cloned() {
-                match kont {
-                    Kont::Halt => {
-                        return Err(JSError::UncaughtException(format!("{:?}", val)));
-                    }
-                    Kont::TryK {
-                        catch_param,
-                        catch_body,
-                        finally_body,
-                        env,
-                        k: outer,
-                    } => {
-                        if catch_body.is_some() {
-                            let catch_env = self.envs.bind(env, catch_param, val);
-                            self.control = Control::Stmt(catch_body);
-                            self.env = catch_env;
+            let Some(kont) = self.conts.get(k) else {
+                break;
+            };
+            match kont {
+                Kont::Halt => {
+                    return Err(JSError::UncaughtException(format!("{:?}", val)));
+                }
+                Kont::TryK {
+                    catch_param,
+                    catch_body,
+                    finally_body,
+                    env,
+                    k: outer,
+                } => {
+                    // Extract Copy fields before mutating self
+                    let catch_param = *catch_param;
+                    let catch_body = *catch_body;
+                    let finally_body = *finally_body;
+                    let env = *env;
+                    let outer = *outer;
 
-                            if finally_body.is_some() {
-                                self.cont = self.conts.alloc(Kont::FinallyK {
-                                    finally_body,
-                                    result: None,
-                                    thrown: None,
-                                    env,
-                                    k: outer,
-                                });
-                            } else {
-                                self.cont = outer;
-                            }
-                        } else if finally_body.is_some() {
-                            self.control = Control::Stmt(finally_body);
-                            self.env = env;
+                    if catch_body.is_some() {
+                        let catch_env = self.envs.bind(env, catch_param, val);
+                        self.control = Control::Stmt(catch_body);
+                        self.env = catch_env;
+
+                        if finally_body.is_some() {
                             self.cont = self.conts.alloc(Kont::FinallyK {
                                 finally_body,
                                 result: None,
-                                thrown: Some(val),
+                                thrown: None,
                                 env,
                                 k: outer,
                             });
                         } else {
-                            k = outer;
-                            continue;
+                            self.cont = outer;
                         }
-                        return Ok(());
+                    } else if finally_body.is_some() {
+                        self.control = Control::Stmt(finally_body);
+                        self.env = env;
+                        self.cont = self.conts.alloc(Kont::FinallyK {
+                            finally_body,
+                            result: None,
+                            thrown: Some(val),
+                            env,
+                            k: outer,
+                        });
+                    } else {
+                        k = outer;
+                        continue;
                     }
-                    _ => {
-                        if let Some(outer) = kont.outer() {
-                            k = outer;
-                        } else {
-                            break;
-                        }
+                    return Ok(());
+                }
+                _ => {
+                    if let Some(outer) = kont.outer() {
+                        k = outer;
+                    } else {
+                        break;
                     }
                 }
-            } else {
-                break;
             }
         }
 
@@ -1675,17 +1689,20 @@ impl CEKH {
             }
 
             ObjectKind::Function(func_data) => {
-                let func_data = func_data.clone();
+                let func_data = *func_data;
 
                 let params = ast.get_param_list(func_data.params_start, func_data.params_count);
 
-                let mut bindings = HashMap::new();
-                for (i, param) in params.iter().enumerate() {
+                let mut bindings_buf: [(StrId, JSValue); 8] = Default::default();
+                let binding_count = params.len().min(8);
+                for (i, param) in params.iter().enumerate().take(8) {
                     let arg = args.get(i).copied().unwrap_or(JSValue::Undefined);
-                    bindings.insert(*param, arg);
+                    bindings_buf[i] = (*param, arg);
                 }
 
-                let call_env = self.envs.extend_with(func_data.env, bindings);
+                let call_env = self
+                    .envs
+                    .extend_with_slice(func_data.env, &bindings_buf[..binding_count]);
 
                 self.cont = self.conts.alloc(Kont::ReturnK { env: self.env, k });
 

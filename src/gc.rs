@@ -145,8 +145,8 @@ impl GC {
             self.work_list.push(WorkItem::Env(parent));
         }
 
-        for (_, value) in env.get_bindings() {
-            self.work_list.push(WorkItem::Value(value.clone()));
+        for (_, value) in env.iter_bindings() {
+            self.work_list.push(WorkItem::Value(value));
         }
     }
 

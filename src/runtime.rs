@@ -1,8 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::Kont;
 use crate::ast::AstArena;
-use crate::cekh::{CEKH, Control};
+use crate::cekh::{Control, CEKH};
 use crate::cont::ContId;
 use crate::env::EnvId;
 use crate::error::{JSError, Result};
@@ -10,6 +9,7 @@ use crate::gc::GC;
 use crate::object::ObjectKind;
 use crate::string_pool::StrId;
 use crate::value::JSValue;
+use crate::Kont;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FiberId(pub u32);

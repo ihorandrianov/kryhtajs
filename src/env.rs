@@ -13,11 +13,143 @@ use crate::value::JSValue;
 /// Environment ID - index into the environment arena
 pub type EnvId = ArenaId<Env>;
 
+const SMALL_ENV_CAPACITY: usize = 2;
+
+/// Bindings storage - inline for small environments, heap for large
+#[derive(Clone, Debug, PartialEq)]
+enum Bindings {
+    Small {
+        entries: [(StrId, JSValue); SMALL_ENV_CAPACITY],
+        len: u8,
+    },
+    Large(HashMap<StrId, JSValue>),
+}
+
+impl Bindings {
+    fn new() -> Self {
+        Bindings::Small {
+            entries: [(StrId(0), JSValue::Undefined); SMALL_ENV_CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn get(&self, name: StrId) -> Option<JSValue> {
+        match self {
+            Bindings::Small { entries, len } => {
+                for i in 0..(*len as usize) {
+                    if entries[i].0 == name {
+                        return Some(entries[i].1);
+                    }
+                }
+                None
+            }
+            Bindings::Large(map) => map.get(&name).copied(),
+        }
+    }
+
+    fn insert(&mut self, name: StrId, value: JSValue) {
+        match self {
+            Bindings::Small { entries, len } => {
+                for i in 0..(*len as usize) {
+                    if entries[i].0 == name {
+                        entries[i].1 = value;
+                        return;
+                    }
+                }
+                if (*len as usize) < SMALL_ENV_CAPACITY {
+                    entries[*len as usize] = (name, value);
+                    *len += 1;
+                } else {
+                    let mut map = HashMap::with_capacity(SMALL_ENV_CAPACITY + 1);
+                    for i in 0..SMALL_ENV_CAPACITY {
+                        map.insert(entries[i].0, entries[i].1);
+                    }
+                    map.insert(name, value);
+                    *self = Bindings::Large(map);
+                }
+            }
+            Bindings::Large(map) => {
+                map.insert(name, value);
+            }
+        }
+    }
+
+    fn contains(&self, name: StrId) -> bool {
+        match self {
+            Bindings::Small { entries, len } => {
+                for i in 0..(*len as usize) {
+                    if entries[i].0 == name {
+                        return true;
+                    }
+                }
+                false
+            }
+            Bindings::Large(map) => map.contains_key(&name),
+        }
+    }
+
+    fn to_hashmap(&self) -> HashMap<StrId, JSValue> {
+        match self {
+            Bindings::Small { entries, len } => {
+                let mut map = HashMap::with_capacity(*len as usize);
+                for i in 0..(*len as usize) {
+                    map.insert(entries[i].0, entries[i].1);
+                }
+                map
+            }
+            Bindings::Large(map) => map.clone(),
+        }
+    }
+
+    fn iter(&self) -> BindingsIter<'_> {
+        match self {
+            Bindings::Small { entries, len } => BindingsIter::Small {
+                entries,
+                len: *len as usize,
+                index: 0,
+            },
+            Bindings::Large(map) => BindingsIter::Large(map.iter()),
+        }
+    }
+}
+
+enum BindingsIter<'a> {
+    Small {
+        entries: &'a [(StrId, JSValue); SMALL_ENV_CAPACITY],
+        len: usize,
+        index: usize,
+    },
+    Large(std::collections::hash_map::Iter<'a, StrId, JSValue>),
+}
+
+impl<'a> Iterator for BindingsIter<'a> {
+    type Item = (StrId, JSValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            BindingsIter::Small {
+                entries,
+                len,
+                index,
+            } => {
+                if *index < *len {
+                    let (k, v) = entries[*index];
+                    *index += 1;
+                    Some((k, v))
+                } else {
+                    None
+                }
+            }
+            BindingsIter::Large(iter) => iter.next().map(|(&k, &v)| (k, v)),
+        }
+    }
+}
+
 /// A single environment frame
 #[derive(Clone, Debug, PartialEq)]
 pub struct Env {
     /// Variable bindings in this frame
-    bindings: HashMap<StrId, JSValue>,
+    bindings: Bindings,
     /// Parent environment (lexical scope chain)
     parent: Option<EnvId>,
 }
@@ -26,7 +158,7 @@ impl Env {
     /// Create an empty environment (global scope)
     pub fn empty() -> Self {
         Self {
-            bindings: HashMap::new(),
+            bindings: Bindings::new(),
             parent: None,
         }
     }
@@ -34,14 +166,48 @@ impl Env {
     /// Create an environment with a parent
     pub fn with_parent(parent: EnvId) -> Self {
         Self {
-            bindings: HashMap::new(),
+            bindings: Bindings::new(),
             parent: Some(parent),
         }
     }
 
     /// Create an environment with bindings and parent
     pub fn with_bindings(bindings: HashMap<StrId, JSValue>, parent: Option<EnvId>) -> Self {
-        Self { bindings, parent }
+        if bindings.len() <= SMALL_ENV_CAPACITY {
+            let mut small_bindings = Bindings::new();
+            for (k, v) in bindings {
+                small_bindings.insert(k, v);
+            }
+            Self {
+                bindings: small_bindings,
+                parent,
+            }
+        } else {
+            Self {
+                bindings: Bindings::Large(bindings),
+                parent,
+            }
+        }
+    }
+
+    /// Create an environment with a slice of bindings (avoids HashMap allocation)
+    pub fn with_binding_slice(bindings: &[(StrId, JSValue)], parent: Option<EnvId>) -> Self {
+        if bindings.len() <= SMALL_ENV_CAPACITY {
+            let mut small_bindings = Bindings::new();
+            for &(k, v) in bindings {
+                small_bindings.insert(k, v);
+            }
+            Self {
+                bindings: small_bindings,
+                parent,
+            }
+        } else {
+            let map: HashMap<_, _> = bindings.iter().copied().collect();
+            Self {
+                bindings: Bindings::Large(map),
+                parent,
+            }
+        }
     }
 }
 
@@ -49,7 +215,7 @@ impl Env {
 impl Env {
     /// Get binding in this frame only (not parent)
     pub fn get_local(&self, name: StrId) -> Option<JSValue> {
-        self.bindings.get(&name).copied()
+        self.bindings.get(name)
     }
 
     /// Set binding in this frame
@@ -59,7 +225,7 @@ impl Env {
 
     /// Check if binding exists in this frame
     pub fn has_local(&self, name: StrId) -> bool {
-        self.bindings.contains_key(&name)
+        self.bindings.contains(name)
     }
 
     /// Get parent environment
@@ -67,8 +233,12 @@ impl Env {
         self.parent
     }
 
-    pub fn get_bindings(&self) -> &HashMap<StrId, JSValue> {
-        &self.bindings
+    pub fn get_bindings(&self) -> HashMap<StrId, JSValue> {
+        self.bindings.to_hashmap()
+    }
+
+    pub fn iter_bindings(&self) -> impl Iterator<Item = (StrId, JSValue)> + '_ {
+        self.bindings.iter()
     }
 }
 
@@ -113,11 +283,16 @@ impl EnvArena {
         self.arena.alloc(Env::with_bindings(bindings, Some(parent)))
     }
 
+    /// Allocate a new environment with bindings from a slice (avoids HashMap allocation)
+    pub fn extend_with_slice(&mut self, parent: EnvId, bindings: &[(StrId, JSValue)]) -> EnvId {
+        self.arena
+            .alloc(Env::with_binding_slice(bindings, Some(parent)))
+    }
+
     /// Create a child environment with a single binding
     pub fn bind(&mut self, parent: EnvId, name: StrId, value: JSValue) -> EnvId {
-        let mut bindings = HashMap::new();
-        bindings.insert(name, value);
-        self.arena.alloc(Env::with_bindings(bindings, Some(parent)))
+        self.arena
+            .alloc(Env::with_binding_slice(&[(name, value)], Some(parent)))
     }
 
     /// Look up a variable, walking the environment chain

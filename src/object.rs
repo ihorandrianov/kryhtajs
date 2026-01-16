@@ -81,7 +81,7 @@ pub struct ArrayData {
 }
 
 /// Function data for CEKH machine (AST-based closures)
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct FunctionData {
     /// Start index into AstArena.param_lists
     pub params_start: u32,
