@@ -11,14 +11,6 @@ pub struct Object {
     pub properties: HashMap<StrId, Property>,
     pub prototype: Option<ObjId>,
     pub kind: ObjectKind,
-    pub ownership: Ownership,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ownership {
-    Unique,
-    Shared(usize),
-    Moved,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -162,7 +154,6 @@ impl Object {
             properties: HashMap::new(),
             prototype: None,
             kind: ObjectKind::Ordinary,
-            ownership: Ownership::Shared(1),
         }
     }
 
@@ -171,27 +162,14 @@ impl Object {
             properties: HashMap::new(),
             prototype: None,
             kind: ObjectKind::Array(ArrayData::default()),
-            ownership: Ownership::Shared(1),
         }
     }
 
-    /// Create a closure (function with captured environment)
     pub fn closure(func_data: FunctionData) -> Self {
         Self {
             properties: HashMap::new(),
             prototype: None,
             kind: ObjectKind::Function(func_data),
-            ownership: Ownership::Shared(1),
-        }
-    }
-
-    /// Create a closure with custom ownership
-    pub fn closure_with_ownership(func_data: FunctionData, ownership: Ownership) -> Self {
-        Self {
-            properties: HashMap::new(),
-            prototype: None,
-            kind: ObjectKind::Function(func_data),
-            ownership,
         }
     }
 
@@ -200,7 +178,6 @@ impl Object {
             properties: HashMap::new(),
             prototype: None,
             kind: ObjectKind::NativeFunction(native_fn),
-            ownership: Ownership::Shared(1),
         }
     }
 

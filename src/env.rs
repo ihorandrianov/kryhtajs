@@ -66,6 +66,10 @@ impl Env {
     pub fn parent(&self) -> Option<EnvId> {
         self.parent
     }
+
+    pub fn get_bindings(&self) -> &HashMap<StrId, JSValue> {
+        &self.bindings
+    }
 }
 
 /// Environment arena with lookup operations
@@ -90,6 +94,18 @@ impl EnvArena {
     /// Allocate a new empty environment with parent
     pub fn extend(&mut self, parent: EnvId) -> EnvId {
         self.arena.alloc(Env::with_parent(parent))
+    }
+
+    pub fn is_marked(&self, id: ArenaId<Env>) -> bool {
+        self.arena.is_marked(id)
+    }
+
+    pub fn mark(&mut self, id: ArenaId<Env>) {
+        self.arena.mark(id);
+    }
+
+    pub fn sweep(&mut self) {
+        self.arena.sweep()
     }
 
     /// Allocate a new environment with bindings

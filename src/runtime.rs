@@ -6,6 +6,7 @@ use crate::cekh::{CEKH, Control};
 use crate::cont::ContId;
 use crate::env::EnvId;
 use crate::error::{JSError, Result};
+use crate::gc::GC;
 use crate::object::ObjectKind;
 use crate::string_pool::StrId;
 use crate::value::JSValue;
@@ -52,8 +53,7 @@ pub struct Runtime {
     pub ready_queue: VecDeque<FiberId>,
     pub current: Option<FiberId>,
     next_fiber_id: u32,
-    // TODO: IO handler placeholder
-    io: (),
+    gc: GC,
 }
 
 impl Runtime {
@@ -64,7 +64,7 @@ impl Runtime {
             ready_queue: VecDeque::new(),
             current: None,
             next_fiber_id: 0,
-            io: (),
+            gc: GC::new(),
         }
     }
 
@@ -184,6 +184,10 @@ impl Runtime {
         args: Vec<JSValue>,
         ast: &AstArena,
     ) -> Result<EffectResult> {
+        if self.gc.should_collect() {
+            self.gc.collect(&mut self.interpreter, &self.fibers);
+        }
+
         let effect_name = self.interpreter.strings.get(effect).unwrap_or("");
 
         match effect_name {

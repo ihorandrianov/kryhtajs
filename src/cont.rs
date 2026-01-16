@@ -459,6 +459,18 @@ impl ContArena {
     pub fn get_mut(&mut self, id: ContId) -> Option<&mut Kont> {
         self.arena.get_mut(id)
     }
+
+    pub fn is_marked(&self, id: ContId) -> bool {
+        self.arena.is_marked(id)
+    }
+
+    pub fn mark(&mut self, id: ContId) {
+        self.arena.mark(id)
+    }
+
+    pub fn sweep(&mut self) {
+        self.arena.sweep()
+    }
 }
 
 impl Default for ContArena {

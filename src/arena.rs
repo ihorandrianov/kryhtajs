@@ -93,15 +93,19 @@ impl<T> Arena<T> {
         self.data.is_empty()
     }
 
-    pub fn clear_marks(&mut self) {
-        for mark in &mut self.marks {
-            *mark = false;
-        }
-    }
-
     pub fn mark(&mut self, id: ArenaId<T>) {
         if let Some(mark) = self.marks.get_mut(id.index()) {
             *mark = true;
+        }
+    }
+
+    pub fn sweep(&mut self) {
+        self.free_list.clear();
+        for (i, mark) in self.marks.iter_mut().enumerate() {
+            if !*mark {
+                self.free_list.push(i as u32);
+            }
+            *mark = false;
         }
     }
 

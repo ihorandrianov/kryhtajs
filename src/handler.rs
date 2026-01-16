@@ -56,6 +56,18 @@ impl HandlerArena {
     pub fn get_mut(&mut self, id: HandlerId) -> Option<&mut Handler> {
         self.arena.get_mut(id)
     }
+
+    pub fn is_marked(&self, id: HandlerId) -> bool {
+        self.arena.is_marked(id)
+    }
+
+    pub fn mark(&mut self, id: HandlerId) {
+        self.arena.mark(id)
+    }
+
+    pub fn sweep(&mut self) {
+        self.arena.sweep()
+    }
 }
 
 impl Default for HandlerArena {
