@@ -75,6 +75,11 @@ impl Runtime {
         }
     }
 
+    /// Reconstruct a runtime from bytes produced by `snapshot::write_runtime`.
+    pub fn from_snapshot(bytes: &[u8]) -> Result<Runtime> {
+        crate::snapshot::read_runtime(bytes)
+    }
+
     /// Parse and run source against this runtime's persistent session state.
     /// Parses against clones and commits only on success, so a syntax error
     /// leaves the session (string pool, AST, globals) intact.
@@ -113,6 +118,19 @@ impl Runtime {
         self.ready_queue.push_back(FiberId(0));
         self.next_fiber_id = 1;
 
+        self.run_scheduler(ast)
+    }
+
+    /// Continue a runtime restored from a snapshot: enter the scheduler
+    /// without the per-run reset.
+    pub fn run_resumed(&mut self) -> Result<JSValue> {
+        let ast = std::mem::take(&mut self.ast);
+        let result = self.run_scheduler(&ast);
+        self.ast = ast;
+        result
+    }
+
+    fn run_scheduler(&mut self, ast: &AstArena) -> Result<JSValue> {
         let mut main_result = JSValue::Undefined;
 
         loop {

@@ -41,6 +41,14 @@ impl GC {
         interpreter.total_allocations() - self.alloc_snapshot > self.threshold
     }
 
+    /// Re-baseline the allocation snapshot to the interpreter's current
+    /// total. Used when restoring a runtime from a snapshot, so the fresh
+    /// `GC::new()` doesn't immediately think a threshold's worth of
+    /// allocations has happened and trigger a spurious collection.
+    pub fn reprime_baseline(&mut self, interpreter: &CEKH) {
+        self.alloc_snapshot = interpreter.total_allocations();
+    }
+
     pub fn collect(&mut self, interpreter: &mut CEKH, fibers: &[Fiber]) {
         self.mark(interpreter, fibers);
         self.sweep(interpreter);

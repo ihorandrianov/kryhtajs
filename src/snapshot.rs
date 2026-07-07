@@ -2,21 +2,23 @@
 //!
 //! Format: magic "KRHT", version u8, little-endian, length-prefixed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
+use crate::arena::Arena;
 use crate::ast::{
     AstArena, BinaryOp, EffectClause, Expr, ExprId, MatchArm, Pattern, PatternField, PatternId,
     PropEntry, Stmt, StmtId, UnaryOp,
 };
-use crate::cekh::Control;
-use crate::cont::Kont;
-use crate::env::{Env, EnvId};
+use crate::cekh::{CEKH, Control};
+use crate::cont::{ContArena, Kont};
+use crate::env::{Env, EnvArena, EnvId};
 use crate::error::{JSError, Result};
-use crate::handler::Handler;
+use crate::gc::GC;
+use crate::handler::{Handler, HandlerArena};
 use crate::object::{
     ArrayData, BoundFunctionData, FunctionData, NativeFn, Object, ObjectKind, Property,
 };
-use crate::runtime::{Fiber, FiberId, FiberStatus};
+use crate::runtime::{Fiber, FiberId, FiberStatus, Runtime};
 use crate::string_pool::{StrId, StringPool};
 use crate::value::{JSValue, ObjId};
 use crate::{ContId, HandlerId};
@@ -1855,6 +1857,194 @@ fn read_ast(r: &mut ByteReader) -> Result<AstArena> {
     Ok(ast)
 }
 
+pub const MAGIC: &[u8; 4] = b"KRHT";
+pub const VERSION: u8 = 1;
+
+fn write_arena<T>(w: &mut ByteWriter, arena: &Arena<T>, write_elem: fn(&mut ByteWriter, &T)) {
+    let slots = arena.slots();
+    w.u32(slots.len() as u32);
+    for elem in slots {
+        write_elem(w, elem);
+    }
+    let free_list = arena.free_list();
+    w.u32(free_list.len() as u32);
+    for &idx in free_list {
+        w.u32(idx);
+    }
+    w.u64(arena.allocations());
+}
+
+fn read_arena<T>(
+    r: &mut ByteReader,
+    read_elem: fn(&mut ByteReader) -> Result<T>,
+) -> Result<Arena<T>> {
+    let n = r.u32()? as usize;
+    let mut data = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        data.push(read_elem(r)?);
+    }
+    let free_n = r.u32()? as usize;
+    let mut free_list = Vec::with_capacity(free_n.min(1 << 16));
+    for _ in 0..free_n {
+        free_list.push(r.u32()?);
+    }
+    let allocations = r.u64()?;
+    Ok(Arena::from_parts(data, free_list, allocations))
+}
+
+fn write_globals(w: &mut ByteWriter, globals: &HashMap<StrId, JSValue>) {
+    w.u32(globals.len() as u32);
+    for (k, v) in globals {
+        w.u32(k.0);
+        write_value(w, *v);
+    }
+}
+
+fn read_globals(r: &mut ByteReader) -> Result<HashMap<StrId, JSValue>> {
+    let n = r.u32()? as usize;
+    let mut map = HashMap::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        let k = StrId(r.u32()?);
+        let v = read_value(r)?;
+        map.insert(k, v);
+    }
+    Ok(map)
+}
+
+/// Serialize the whole runtime: session state (strings/ast), the CEKH heap
+/// (objects/envs/conts/handlers/globals), the fiber table, and scheduler
+/// bookkeeping. `current` is intentionally NOT serialized — a restored
+/// runtime always starts with no fiber selected; `select_next_fiber` picks
+/// one from the restored ready queue on the next `run_resumed`.
+///
+/// `ready_override` lets a caller (e.g. the Snapshot! effect handler) put
+/// the performing fiber at the front of the queue in the snapshot without
+/// mutating the live `rt.ready_queue`.
+pub fn write_runtime(rt: &Runtime, ready_override: &VecDeque<FiberId>) -> Vec<u8> {
+    let mut w = ByteWriter::new();
+    for &b in MAGIC {
+        w.u8(b);
+    }
+    w.u8(VERSION);
+
+    write_strings(&mut w, &rt.interpreter.strings);
+    write_ast(&mut w, &rt.ast);
+
+    write_arena(&mut w, &rt.interpreter.objects, write_object);
+    write_arena(&mut w, rt.interpreter.envs.arena(), write_env);
+    write_arena(&mut w, rt.interpreter.conts.arena(), write_kont);
+    write_arena(&mut w, rt.interpreter.handlers.arena(), write_handler);
+
+    write_control(&mut w, &rt.interpreter.control);
+    w.u32(rt.interpreter.env.index() as u32);
+    w.u32(rt.interpreter.cont.index() as u32);
+
+    write_globals(&mut w, &rt.interpreter.globals);
+
+    w.u32(rt.fibers.len() as u32);
+    for fiber in &rt.fibers {
+        write_fiber(&mut w, fiber);
+    }
+
+    w.u32(ready_override.len() as u32);
+    for id in ready_override {
+        w.u32(id.0);
+    }
+    w.u32(rt.next_fiber_id);
+    w.u32(rt.join_waiters.len() as u32);
+    for (fiber_id, waiters) in &rt.join_waiters {
+        w.u32(fiber_id.0);
+        w.u32(waiters.len() as u32);
+        for waiter in waiters {
+            w.u32(waiter.0);
+        }
+    }
+
+    w.finish()
+}
+
+/// Reconstruct a `Runtime` from bytes produced by `write_runtime`.
+/// `current` is not part of the format; the restored runtime starts with
+/// no fiber selected.
+pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
+    let mut r = ByteReader::new(bytes);
+    let magic = [r.u8()?, r.u8()?, r.u8()?, r.u8()?];
+    if &magic != MAGIC {
+        return Err(JSError::Message("snapshot: bad magic".to_string()));
+    }
+    let version = r.u8()?;
+    if version != VERSION {
+        return Err(JSError::Message(format!(
+            "snapshot: unsupported version {version} (expected {VERSION})"
+        )));
+    }
+
+    let strings = read_strings(&mut r)?;
+    let ast = read_ast(&mut r)?;
+
+    let objects = read_arena(&mut r, read_object)?;
+    let envs = EnvArena::from_arena(read_arena(&mut r, read_env)?);
+    let conts = ContArena::from_arena(read_arena(&mut r, read_kont)?);
+    let handlers = HandlerArena::from_arena(read_arena(&mut r, read_handler)?);
+
+    let control = read_control(&mut r)?;
+    let env = EnvId::new(r.u32()?);
+    let cont = ContId::new(r.u32()?);
+
+    let globals = read_globals(&mut r)?;
+
+    let n = r.u32()? as usize;
+    let mut fibers = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        fibers.push(read_fiber(&mut r)?);
+    }
+
+    let n = r.u32()? as usize;
+    let mut ready_queue = VecDeque::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        ready_queue.push_back(FiberId(r.u32()?));
+    }
+    let next_fiber_id = r.u32()?;
+
+    let n = r.u32()? as usize;
+    let mut join_waiters = HashMap::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        let fiber_id = FiberId(r.u32()?);
+        let wn = r.u32()? as usize;
+        let mut waiters = Vec::with_capacity(wn.min(1 << 16));
+        for _ in 0..wn {
+            waiters.push(FiberId(r.u32()?));
+        }
+        join_waiters.insert(fiber_id, waiters);
+    }
+
+    let interpreter = CEKH {
+        control,
+        env,
+        cont,
+        envs,
+        conts,
+        handlers,
+        objects,
+        strings,
+        globals,
+    };
+
+    let mut gc = GC::new();
+    gc.reprime_baseline(&interpreter);
+
+    Ok(Runtime {
+        interpreter,
+        fibers,
+        ready_queue,
+        current: None,
+        next_fiber_id,
+        join_waiters,
+        gc,
+        ast,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2730,5 +2920,36 @@ mod tests {
         bad.u8(200);
         let bad_bytes = bad.finish();
         assert!(read_pattern(&mut ByteReader::new(&bad_bytes)).is_err());
+    }
+
+    #[test]
+    fn runtime_round_trips_and_continues() {
+        use crate::Runtime;
+
+        let mut rt = Runtime::new();
+        rt.eval("function inc(x) { return x + 1 } var state = { count: inc(41) }")
+            .unwrap();
+
+        let bytes = write_runtime(&rt, &rt.ready_queue);
+        let mut rt2 = Runtime::from_snapshot(&bytes).unwrap();
+        // restored session state is fully usable: closure + heap survive
+        assert_eq!(
+            rt2.eval("state.count === 42 && inc(1) === 2").unwrap(),
+            crate::JSValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn bad_magic_and_version_are_rejected() {
+        use crate::Runtime;
+
+        assert!(Runtime::from_snapshot(b"NOPE").is_err());
+
+        let rt = Runtime::new();
+        let mut bytes = write_runtime(&rt, &rt.ready_queue);
+        bytes[4] = 99; // version byte
+        assert!(Runtime::from_snapshot(&bytes).is_err());
+        bytes.truncate(bytes.len() / 2);
+        assert!(Runtime::from_snapshot(&bytes).is_err());
     }
 }
