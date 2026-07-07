@@ -45,6 +45,14 @@ impl HandlerArena {
         }
     }
 
+    pub fn arena(&self) -> &Arena<Handler> {
+        &self.arena
+    }
+
+    pub fn from_arena(arena: Arena<Handler>) -> Self {
+        Self { arena }
+    }
+
     pub fn alloc(&mut self, handler: Handler) -> HandlerId {
         self.arena.alloc(handler)
     }

@@ -256,6 +256,18 @@ impl EnvArena {
         Self { arena, global }
     }
 
+    pub fn arena(&self) -> &Arena<Env> {
+        &self.arena
+    }
+
+    /// Rebuild from a deserialized arena; slot 0 is the global env.
+    pub fn from_arena(arena: Arena<Env>) -> Self {
+        Self {
+            arena,
+            global: ArenaId::new(0),
+        }
+    }
+
     /// Get the global environment
     pub fn global(&self) -> EnvId {
         self.global

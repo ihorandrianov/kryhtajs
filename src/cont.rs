@@ -420,6 +420,18 @@ impl ContArena {
         Self { arena, halt }
     }
 
+    pub fn arena(&self) -> &Arena<Kont> {
+        &self.arena
+    }
+
+    /// Rebuild from a deserialized arena; slot 0 is the halt continuation.
+    pub fn from_arena(arena: Arena<Kont>) -> Self {
+        Self {
+            arena,
+            halt: ArenaId::new(0),
+        }
+    }
+
     /// Get the halt continuation
     pub fn halt(&self) -> ContId {
         self.halt

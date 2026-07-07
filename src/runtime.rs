@@ -53,12 +53,12 @@ pub struct Runtime {
     pub fibers: Vec<Fiber>,
     pub ready_queue: VecDeque<FiberId>,
     pub current: Option<FiberId>,
-    next_fiber_id: u32,
-    join_waiters: HashMap<FiberId, Vec<FiberId>>,
-    gc: GC,
+    pub(crate) next_fiber_id: u32,
+    pub(crate) join_waiters: HashMap<FiberId, Vec<FiberId>>,
+    pub(crate) gc: GC,
     /// Session AST — grows across `eval` calls so function bodies from
     /// earlier evals stay resolvable.
-    ast: AstArena,
+    pub(crate) ast: AstArena,
 }
 
 impl Runtime {

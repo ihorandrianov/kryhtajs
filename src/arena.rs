@@ -145,6 +145,26 @@ impl<T> Arena<T> {
             .enumerate()
             .map(|(i, v)| (ArenaId::new(i as u32), v))
     }
+
+    pub fn slots(&self) -> &[T] {
+        &self.data
+    }
+
+    pub fn free_list(&self) -> &[u32] {
+        &self.free_list
+    }
+
+    /// Rebuild an arena from serialized parts. Marks are transient GC
+    /// state and start cleared.
+    pub fn from_parts(data: Vec<T>, free_list: Vec<u32>, allocations: u64) -> Self {
+        let marks = vec![false; data.len()];
+        Self {
+            data,
+            free_list,
+            marks,
+            allocations,
+        }
+    }
 }
 
 impl<T> Default for Arena<T> {
@@ -161,5 +181,33 @@ impl<T: Clone> Clone for Arena<T> {
             marks: self.marks.clone(),
             allocations: self.allocations,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_parts_reconstructs_arena() {
+        let mut a: Arena<u32> = Arena::new();
+        let id0 = a.alloc(10);
+        let _id1 = a.alloc(20);
+        a.mark(id0);
+        a.sweep(); // frees slot 1
+
+        let data = a.slots().to_vec();
+        let free = a.free_list().to_vec();
+        let allocs = a.allocations();
+
+        let b: Arena<u32> = Arena::from_parts(data, free, allocs);
+        assert_eq!(b.get(ArenaId::new(0)), Some(&10));
+        assert_eq!(b.len(), a.len());
+        assert_eq!(b.free_list(), a.free_list());
+        assert_eq!(b.allocations(), allocs);
+        // freed slot is reused first, exactly like the original
+        let mut b = b;
+        let reused = b.alloc(99);
+        assert_eq!(reused.index(), 1);
     }
 }
