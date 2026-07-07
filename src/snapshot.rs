@@ -4,8 +4,12 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{ExprId, StmtId};
+use crate::ast::{
+    AstArena, BinaryOp, EffectClause, Expr, ExprId, MatchArm, Pattern, PatternField, PatternId,
+    PropEntry, Stmt, StmtId, UnaryOp,
+};
 use crate::cekh::Control;
+use crate::cont::Kont;
 use crate::env::{Env, EnvId};
 use crate::error::{JSError, Result};
 use crate::handler::Handler;
@@ -526,9 +530,1376 @@ fn read_strings(r: &mut ByteReader) -> Result<StringPool> {
     Ok(pool)
 }
 
+fn write_binary_op(w: &mut ByteWriter, op: BinaryOp) {
+    w.u8(op as u8);
+}
+
+fn read_binary_op(r: &mut ByteReader) -> Result<BinaryOp> {
+    Ok(match r.u8()? {
+        0 => BinaryOp::Add,
+        1 => BinaryOp::Sub,
+        2 => BinaryOp::Mul,
+        3 => BinaryOp::Div,
+        4 => BinaryOp::Mod,
+        5 => BinaryOp::Pow,
+        6 => BinaryOp::Eq,
+        7 => BinaryOp::Ne,
+        8 => BinaryOp::Lt,
+        9 => BinaryOp::Le,
+        10 => BinaryOp::Gt,
+        11 => BinaryOp::Ge,
+        12 => BinaryOp::And,
+        13 => BinaryOp::Or,
+        14 => BinaryOp::BitAnd,
+        15 => BinaryOp::BitOr,
+        16 => BinaryOp::BitXor,
+        17 => BinaryOp::Shl,
+        18 => BinaryOp::Shr,
+        19 => BinaryOp::UShr,
+        20 => BinaryOp::NullishCoalesce,
+        tag => {
+            return Err(JSError::Message(format!(
+                "snapshot: bad binary op tag {tag}"
+            )));
+        }
+    })
+}
+
+fn write_unary_op(w: &mut ByteWriter, op: UnaryOp) {
+    w.u8(op as u8);
+}
+
+fn read_unary_op(r: &mut ByteReader) -> Result<UnaryOp> {
+    Ok(match r.u8()? {
+        0 => UnaryOp::Neg,
+        1 => UnaryOp::Not,
+        2 => UnaryOp::BitNot,
+        3 => UnaryOp::TypeOf,
+        4 => UnaryOp::Plus,
+        5 => UnaryOp::PreInc,
+        6 => UnaryOp::PreDec,
+        7 => UnaryOp::PostInc,
+        8 => UnaryOp::PostDec,
+        tag => {
+            return Err(JSError::Message(format!(
+                "snapshot: bad unary op tag {tag}"
+            )));
+        }
+    })
+}
+
+fn write_kont(w: &mut ByteWriter, k: &Kont) {
+    match k {
+        Kont::Halt => w.u8(0),
+        Kont::UnaryK { op, k } => {
+            w.u8(1);
+            write_unary_op(w, *op);
+            w.u32(k.index() as u32);
+        }
+        Kont::BinaryLeftK { op, right, env, k } => {
+            w.u8(2);
+            write_binary_op(w, *op);
+            w.u32(right.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::BinaryRightK { op, left, k } => {
+            w.u8(3);
+            write_binary_op(w, *op);
+            write_value(w, *left);
+            w.u32(k.index() as u32);
+        }
+        Kont::AndK { right, env, k } => {
+            w.u8(4);
+            w.u32(right.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::OrK { right, env, k } => {
+            w.u8(5);
+            w.u32(right.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::NullishK { right, env, k } => {
+            w.u8(6);
+            w.u32(right.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::MemberK { property, k } => {
+            w.u8(7);
+            w.u32(property.0);
+            w.u32(k.index() as u32);
+        }
+        Kont::IndexObjK { index, env, k } => {
+            w.u8(8);
+            w.u32(index.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::IndexKeyK { obj, k } => {
+            w.u8(9);
+            write_value(w, *obj);
+            w.u32(k.index() as u32);
+        }
+        Kont::AssignVarK { name, env, k } => {
+            w.u8(10);
+            w.u32(name.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::UpdateVarK {
+            name,
+            is_pre,
+            is_inc,
+            env,
+            k,
+        } => {
+            w.u8(11);
+            w.u32(name.0);
+            w.bool_(*is_pre);
+            w.bool_(*is_inc);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::AssignMemberObjK {
+            property,
+            value,
+            env,
+            k,
+        } => {
+            w.u8(12);
+            w.u32(property.0);
+            w.u32(value.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::AssignMemberValK { obj, property, k } => {
+            w.u8(13);
+            write_value(w, *obj);
+            w.u32(property.0);
+            w.u32(k.index() as u32);
+        }
+        Kont::AssignIndexObjK {
+            index,
+            value,
+            env,
+            k,
+        } => {
+            w.u8(14);
+            w.u32(index.0);
+            w.u32(value.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::AssignIndexKeyK { obj, value, env, k } => {
+            w.u8(15);
+            write_value(w, *obj);
+            w.u32(value.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::AssignIndexValK { obj, key, k } => {
+            w.u8(16);
+            write_value(w, *obj);
+            write_value(w, *key);
+            w.u32(k.index() as u32);
+        }
+        Kont::IfK {
+            consequent,
+            alternate,
+            env,
+            k,
+        } => {
+            w.u8(17);
+            w.u32(consequent.0);
+            w.u32(alternate.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::CondK {
+            consequent,
+            alternate,
+            env,
+            k,
+        } => {
+            w.u8(18);
+            w.u32(consequent.0);
+            w.u32(alternate.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::WhileK { test, body, env, k } => {
+            w.u8(19);
+            w.u32(test.0);
+            w.u32(body.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::WhileBodyK { test, body, env, k } => {
+            w.u8(20);
+            w.u32(test.0);
+            w.u32(body.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::ForTestK {
+            test,
+            update,
+            body,
+            env,
+            k,
+        } => {
+            w.u8(21);
+            w.u32(test.0);
+            w.u32(update.0);
+            w.u32(body.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::ForTestResultK {
+            test,
+            update,
+            body,
+            env,
+            k,
+        } => {
+            w.u8(22);
+            w.u32(test.0);
+            w.u32(update.0);
+            w.u32(body.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::ForBodyK {
+            test,
+            update,
+            body,
+            env,
+            k,
+        } => {
+            w.u8(23);
+            w.u32(test.0);
+            w.u32(update.0);
+            w.u32(body.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::ForUpdateK {
+            test,
+            update,
+            body,
+            env,
+            k,
+        } => {
+            w.u8(24);
+            w.u32(test.0);
+            w.u32(update.0);
+            w.u32(body.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::CalleeK {
+            args_start,
+            args_count,
+            env,
+            k,
+        } => {
+            w.u8(25);
+            w.u32(*args_start);
+            w.u16(*args_count);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::ArgsK {
+            callee,
+            done,
+            args_start,
+            args_idx,
+            args_count,
+            env,
+            k,
+        } => {
+            w.u8(26);
+            write_value(w, *callee);
+            write_seq_values(w, done);
+            w.u32(*args_start);
+            w.u16(*args_idx);
+            w.u16(*args_count);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::ReturnK { env, k } => {
+            w.u8(27);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::ReturnExprK { k } => {
+            w.u8(28);
+            w.u32(k.index() as u32);
+        }
+        Kont::ArrayK {
+            done,
+            elems_start,
+            elems_idx,
+            elems_count,
+            env,
+            k,
+        } => {
+            w.u8(29);
+            write_seq_values(w, done);
+            w.u32(*elems_start);
+            w.u16(*elems_idx);
+            w.u16(*elems_count);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::ObjectK {
+            done,
+            props_start,
+            props_idx,
+            props_count,
+            env,
+            k,
+        } => {
+            w.u8(30);
+            w.u32(done.len() as u32);
+            for (key, value) in done {
+                w.u32(key.0);
+                write_value(w, *value);
+            }
+            w.u32(*props_start);
+            w.u16(*props_idx);
+            w.u16(*props_count);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::LetK { name, env, k } => {
+            w.u8(31);
+            w.u32(name.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::ConstK { name, env, k } => {
+            w.u8(32);
+            w.u32(name.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::VarK { name, env, k } => {
+            w.u8(33);
+            w.u32(name.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::SeqK {
+            stmts_start,
+            stmts_idx,
+            stmts_count,
+            env,
+            k,
+        } => {
+            w.u8(34);
+            w.u32(*stmts_start);
+            w.u32(*stmts_idx);
+            w.u32(*stmts_count);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::ExprStmtK { k } => {
+            w.u8(35);
+            w.u32(k.index() as u32);
+        }
+        Kont::BlockK {
+            stmts_start,
+            stmts_idx,
+            stmts_count,
+            final_expr,
+            env,
+            k,
+        } => {
+            w.u8(36);
+            w.u32(*stmts_start);
+            w.u32(*stmts_idx);
+            w.u32(*stmts_count);
+            w.u32(final_expr.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::MatchK {
+            arms_start,
+            arms_idx,
+            arms_count,
+            env,
+            k,
+        } => {
+            w.u8(37);
+            w.u32(*arms_start);
+            w.u16(*arms_idx);
+            w.u16(*arms_count);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::HandlerK {
+            clauses_start,
+            clauses_count,
+            env,
+            return_body,
+            return_param,
+            k,
+        } => {
+            w.u8(38);
+            w.u32(*clauses_start);
+            w.u16(*clauses_count);
+            w.u32(env.index() as u32);
+            w.u32(return_body.0);
+            w.u32(return_param.0);
+            w.u32(k.index() as u32);
+        }
+        Kont::PerformArgsK {
+            effect,
+            done,
+            args_start,
+            args_idx,
+            args_count,
+            env,
+            k,
+        } => {
+            w.u8(39);
+            w.u32(effect.0);
+            write_seq_values(w, done);
+            w.u32(*args_start);
+            w.u16(*args_idx);
+            w.u16(*args_count);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+        Kont::HandleWithK { body, env, k } => {
+            w.u8(40);
+            w.u32(body.0);
+            w.u32(env.index() as u32);
+            w.u32(k.index() as u32);
+        }
+    }
+}
+
+fn read_kont(r: &mut ByteReader) -> Result<Kont> {
+    Ok(match r.u8()? {
+        0 => Kont::Halt,
+        1 => Kont::UnaryK {
+            op: read_unary_op(r)?,
+            k: ContId::new(r.u32()?),
+        },
+        2 => Kont::BinaryLeftK {
+            op: read_binary_op(r)?,
+            right: ExprId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        3 => Kont::BinaryRightK {
+            op: read_binary_op(r)?,
+            left: read_value(r)?,
+            k: ContId::new(r.u32()?),
+        },
+        4 => Kont::AndK {
+            right: ExprId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        5 => Kont::OrK {
+            right: ExprId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        6 => Kont::NullishK {
+            right: ExprId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        7 => Kont::MemberK {
+            property: StrId(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        8 => Kont::IndexObjK {
+            index: ExprId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        9 => Kont::IndexKeyK {
+            obj: read_value(r)?,
+            k: ContId::new(r.u32()?),
+        },
+        10 => Kont::AssignVarK {
+            name: StrId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        11 => Kont::UpdateVarK {
+            name: StrId(r.u32()?),
+            is_pre: r.bool_()?,
+            is_inc: r.bool_()?,
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        12 => Kont::AssignMemberObjK {
+            property: StrId(r.u32()?),
+            value: ExprId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        13 => Kont::AssignMemberValK {
+            obj: read_value(r)?,
+            property: StrId(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        14 => Kont::AssignIndexObjK {
+            index: ExprId(r.u32()?),
+            value: ExprId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        15 => Kont::AssignIndexKeyK {
+            obj: read_value(r)?,
+            value: ExprId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        16 => Kont::AssignIndexValK {
+            obj: read_value(r)?,
+            key: read_value(r)?,
+            k: ContId::new(r.u32()?),
+        },
+        17 => Kont::IfK {
+            consequent: StmtId(r.u32()?),
+            alternate: StmtId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        18 => Kont::CondK {
+            consequent: ExprId(r.u32()?),
+            alternate: ExprId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        19 => Kont::WhileK {
+            test: ExprId(r.u32()?),
+            body: StmtId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        20 => Kont::WhileBodyK {
+            test: ExprId(r.u32()?),
+            body: StmtId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        21 => Kont::ForTestK {
+            test: ExprId(r.u32()?),
+            update: ExprId(r.u32()?),
+            body: StmtId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        22 => Kont::ForTestResultK {
+            test: ExprId(r.u32()?),
+            update: ExprId(r.u32()?),
+            body: StmtId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        23 => Kont::ForBodyK {
+            test: ExprId(r.u32()?),
+            update: ExprId(r.u32()?),
+            body: StmtId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        24 => Kont::ForUpdateK {
+            test: ExprId(r.u32()?),
+            update: ExprId(r.u32()?),
+            body: StmtId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        25 => Kont::CalleeK {
+            args_start: r.u32()?,
+            args_count: r.u16()?,
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        26 => Kont::ArgsK {
+            callee: read_value(r)?,
+            done: read_seq_values(r)?,
+            args_start: r.u32()?,
+            args_idx: r.u16()?,
+            args_count: r.u16()?,
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        27 => Kont::ReturnK {
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        28 => Kont::ReturnExprK {
+            k: ContId::new(r.u32()?),
+        },
+        29 => Kont::ArrayK {
+            done: read_seq_values(r)?,
+            elems_start: r.u32()?,
+            elems_idx: r.u16()?,
+            elems_count: r.u16()?,
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        30 => {
+            let n = r.u32()? as usize;
+            let mut done = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                let key = StrId(r.u32()?);
+                let value = read_value(r)?;
+                done.push((key, value));
+            }
+            Kont::ObjectK {
+                done,
+                props_start: r.u32()?,
+                props_idx: r.u16()?,
+                props_count: r.u16()?,
+                env: EnvId::new(r.u32()?),
+                k: ContId::new(r.u32()?),
+            }
+        }
+        31 => Kont::LetK {
+            name: StrId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        32 => Kont::ConstK {
+            name: StrId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        33 => Kont::VarK {
+            name: StrId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        34 => Kont::SeqK {
+            stmts_start: r.u32()?,
+            stmts_idx: r.u32()?,
+            stmts_count: r.u32()?,
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        35 => Kont::ExprStmtK {
+            k: ContId::new(r.u32()?),
+        },
+        36 => Kont::BlockK {
+            stmts_start: r.u32()?,
+            stmts_idx: r.u32()?,
+            stmts_count: r.u32()?,
+            final_expr: ExprId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        37 => Kont::MatchK {
+            arms_start: r.u32()?,
+            arms_idx: r.u16()?,
+            arms_count: r.u16()?,
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        38 => Kont::HandlerK {
+            clauses_start: r.u32()?,
+            clauses_count: r.u16()?,
+            env: EnvId::new(r.u32()?),
+            return_body: ExprId(r.u32()?),
+            return_param: StrId(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        39 => Kont::PerformArgsK {
+            effect: StrId(r.u32()?),
+            done: read_seq_values(r)?,
+            args_start: r.u32()?,
+            args_idx: r.u16()?,
+            args_count: r.u16()?,
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        40 => Kont::HandleWithK {
+            body: ExprId(r.u32()?),
+            env: EnvId::new(r.u32()?),
+            k: ContId::new(r.u32()?),
+        },
+        tag => return Err(JSError::Message(format!("snapshot: bad kont tag {tag}"))),
+    })
+}
+
+fn write_expr(w: &mut ByteWriter, e: &Expr) {
+    match e {
+        Expr::Empty => w.u8(0),
+        Expr::Undefined => w.u8(1),
+        Expr::Null => w.u8(2),
+        Expr::Bool(b) => {
+            w.u8(3);
+            w.bool_(*b);
+        }
+        Expr::Int(n) => {
+            w.u8(4);
+            w.i32(*n);
+        }
+        Expr::Float(idx) => {
+            w.u8(5);
+            w.u32(*idx);
+        }
+        Expr::String(s) => {
+            w.u8(6);
+            w.u32(s.0);
+        }
+        Expr::Identifier(s) => {
+            w.u8(7);
+            w.u32(s.0);
+        }
+        Expr::Binary { op, left, right } => {
+            w.u8(8);
+            write_binary_op(w, *op);
+            w.u32(left.0);
+            w.u32(right.0);
+        }
+        Expr::Unary { op, operand } => {
+            w.u8(9);
+            write_unary_op(w, *op);
+            w.u32(operand.0);
+        }
+        Expr::Call {
+            callee,
+            args_start,
+            args_count,
+        } => {
+            w.u8(10);
+            w.u32(callee.0);
+            w.u32(*args_start);
+            w.u16(*args_count);
+        }
+        Expr::Member { object, property } => {
+            w.u8(11);
+            w.u32(object.0);
+            w.u32(property.0);
+        }
+        Expr::Index { object, index } => {
+            w.u8(12);
+            w.u32(object.0);
+            w.u32(index.0);
+        }
+        Expr::Assign { target, value } => {
+            w.u8(13);
+            w.u32(target.0);
+            w.u32(value.0);
+        }
+        Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            w.u8(14);
+            w.u32(test.0);
+            w.u32(consequent.0);
+            w.u32(alternate.0);
+        }
+        Expr::Array {
+            elems_start,
+            elems_count,
+        } => {
+            w.u8(15);
+            w.u32(*elems_start);
+            w.u16(*elems_count);
+        }
+        Expr::Object {
+            props_start,
+            props_count,
+        } => {
+            w.u8(16);
+            w.u32(*props_start);
+            w.u16(*props_count);
+        }
+        Expr::Function {
+            name,
+            params_start,
+            params_count,
+            body,
+        } => {
+            w.u8(17);
+            w.u32(name.0);
+            w.u32(*params_start);
+            w.u16(*params_count);
+            w.u32(body.0);
+        }
+        Expr::Handler {
+            clauses_start,
+            clauses_count,
+            return_param,
+            return_body,
+        } => {
+            w.u8(18);
+            w.u32(*clauses_start);
+            w.u16(*clauses_count);
+            w.u32(return_param.0);
+            w.u32(return_body.0);
+        }
+        Expr::Arrow {
+            params_start,
+            params_count,
+            body,
+            is_block,
+        } => {
+            w.u8(19);
+            w.u32(*params_start);
+            w.u16(*params_count);
+            w.u32(body.0);
+            w.bool_(*is_block);
+        }
+        Expr::This => w.u8(20),
+        Expr::Block {
+            stmts_start,
+            stmts_count,
+            final_expr,
+        } => {
+            w.u8(21);
+            w.u32(*stmts_start);
+            w.u32(*stmts_count);
+            w.u32(final_expr.0);
+        }
+        Expr::Match {
+            scrutinee,
+            arms_start,
+            arms_count,
+        } => {
+            w.u8(22);
+            w.u32(scrutinee.0);
+            w.u32(*arms_start);
+            w.u16(*arms_count);
+        }
+        Expr::Perform {
+            effect,
+            args_start,
+            args_count,
+        } => {
+            w.u8(23);
+            w.u32(effect.0);
+            w.u32(*args_start);
+            w.u16(*args_count);
+        }
+        Expr::Handle {
+            body,
+            clauses_start,
+            clauses_count,
+            return_param,
+            return_body,
+        } => {
+            w.u8(24);
+            w.u32(body.0);
+            w.u32(*clauses_start);
+            w.u16(*clauses_count);
+            w.u32(return_param.0);
+            w.u32(return_body.0);
+        }
+        Expr::HandleWith { body, handler } => {
+            w.u8(25);
+            w.u32(body.0);
+            w.u32(handler.0);
+        }
+    }
+}
+
+fn read_expr(r: &mut ByteReader) -> Result<Expr> {
+    Ok(match r.u8()? {
+        0 => Expr::Empty,
+        1 => Expr::Undefined,
+        2 => Expr::Null,
+        3 => Expr::Bool(r.bool_()?),
+        4 => Expr::Int(r.i32()?),
+        5 => Expr::Float(r.u32()?),
+        6 => Expr::String(StrId(r.u32()?)),
+        7 => Expr::Identifier(StrId(r.u32()?)),
+        8 => Expr::Binary {
+            op: read_binary_op(r)?,
+            left: ExprId(r.u32()?),
+            right: ExprId(r.u32()?),
+        },
+        9 => Expr::Unary {
+            op: read_unary_op(r)?,
+            operand: ExprId(r.u32()?),
+        },
+        10 => Expr::Call {
+            callee: ExprId(r.u32()?),
+            args_start: r.u32()?,
+            args_count: r.u16()?,
+        },
+        11 => Expr::Member {
+            object: ExprId(r.u32()?),
+            property: StrId(r.u32()?),
+        },
+        12 => Expr::Index {
+            object: ExprId(r.u32()?),
+            index: ExprId(r.u32()?),
+        },
+        13 => Expr::Assign {
+            target: ExprId(r.u32()?),
+            value: ExprId(r.u32()?),
+        },
+        14 => Expr::Conditional {
+            test: ExprId(r.u32()?),
+            consequent: ExprId(r.u32()?),
+            alternate: ExprId(r.u32()?),
+        },
+        15 => Expr::Array {
+            elems_start: r.u32()?,
+            elems_count: r.u16()?,
+        },
+        16 => Expr::Object {
+            props_start: r.u32()?,
+            props_count: r.u16()?,
+        },
+        17 => Expr::Function {
+            name: StrId(r.u32()?),
+            params_start: r.u32()?,
+            params_count: r.u16()?,
+            body: StmtId(r.u32()?),
+        },
+        18 => Expr::Handler {
+            clauses_start: r.u32()?,
+            clauses_count: r.u16()?,
+            return_param: StrId(r.u32()?),
+            return_body: ExprId(r.u32()?),
+        },
+        19 => Expr::Arrow {
+            params_start: r.u32()?,
+            params_count: r.u16()?,
+            body: ExprId(r.u32()?),
+            is_block: r.bool_()?,
+        },
+        20 => Expr::This,
+        21 => Expr::Block {
+            stmts_start: r.u32()?,
+            stmts_count: r.u32()?,
+            final_expr: ExprId(r.u32()?),
+        },
+        22 => Expr::Match {
+            scrutinee: ExprId(r.u32()?),
+            arms_start: r.u32()?,
+            arms_count: r.u16()?,
+        },
+        23 => Expr::Perform {
+            effect: StrId(r.u32()?),
+            args_start: r.u32()?,
+            args_count: r.u16()?,
+        },
+        24 => Expr::Handle {
+            body: ExprId(r.u32()?),
+            clauses_start: r.u32()?,
+            clauses_count: r.u16()?,
+            return_param: StrId(r.u32()?),
+            return_body: ExprId(r.u32()?),
+        },
+        25 => Expr::HandleWith {
+            body: ExprId(r.u32()?),
+            handler: ExprId(r.u32()?),
+        },
+        tag => return Err(JSError::Message(format!("snapshot: bad expr tag {tag}"))),
+    })
+}
+
+fn write_stmt(w: &mut ByteWriter, s: &Stmt) {
+    match s {
+        Stmt::Empty => w.u8(0),
+        Stmt::Expr(e) => {
+            w.u8(1);
+            w.u32(e.0);
+        }
+        Stmt::Let { name, init } => {
+            w.u8(2);
+            w.u32(name.0);
+            w.u32(init.0);
+        }
+        Stmt::Const { name, init } => {
+            w.u8(3);
+            w.u32(name.0);
+            w.u32(init.0);
+        }
+        Stmt::Var { name, init } => {
+            w.u8(4);
+            w.u32(name.0);
+            w.u32(init.0);
+        }
+        Stmt::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            w.u8(5);
+            w.u32(test.0);
+            w.u32(consequent.0);
+            w.u32(alternate.0);
+        }
+        Stmt::While { test, body } => {
+            w.u8(6);
+            w.u32(test.0);
+            w.u32(body.0);
+        }
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            w.u8(7);
+            w.u32(init.0);
+            w.u32(test.0);
+            w.u32(update.0);
+            w.u32(body.0);
+        }
+        Stmt::Block {
+            stmts_start,
+            stmts_count,
+        } => {
+            w.u8(8);
+            w.u32(*stmts_start);
+            w.u32(*stmts_count);
+        }
+        Stmt::Declarations {
+            stmts_start,
+            stmts_count,
+        } => {
+            w.u8(9);
+            w.u32(*stmts_start);
+            w.u32(*stmts_count);
+        }
+        Stmt::Return(e) => {
+            w.u8(10);
+            w.u32(e.0);
+        }
+        Stmt::Break => w.u8(11),
+        Stmt::Continue => w.u8(12),
+        Stmt::Function {
+            name,
+            params_start,
+            params_count,
+            body,
+        } => {
+            w.u8(13);
+            w.u32(name.0);
+            w.u32(*params_start);
+            w.u16(*params_count);
+            w.u32(body.0);
+        }
+    }
+}
+
+fn read_stmt(r: &mut ByteReader) -> Result<Stmt> {
+    Ok(match r.u8()? {
+        0 => Stmt::Empty,
+        1 => Stmt::Expr(ExprId(r.u32()?)),
+        2 => Stmt::Let {
+            name: StrId(r.u32()?),
+            init: ExprId(r.u32()?),
+        },
+        3 => Stmt::Const {
+            name: StrId(r.u32()?),
+            init: ExprId(r.u32()?),
+        },
+        4 => Stmt::Var {
+            name: StrId(r.u32()?),
+            init: ExprId(r.u32()?),
+        },
+        5 => Stmt::If {
+            test: ExprId(r.u32()?),
+            consequent: StmtId(r.u32()?),
+            alternate: StmtId(r.u32()?),
+        },
+        6 => Stmt::While {
+            test: ExprId(r.u32()?),
+            body: StmtId(r.u32()?),
+        },
+        7 => Stmt::For {
+            init: StmtId(r.u32()?),
+            test: ExprId(r.u32()?),
+            update: ExprId(r.u32()?),
+            body: StmtId(r.u32()?),
+        },
+        8 => Stmt::Block {
+            stmts_start: r.u32()?,
+            stmts_count: r.u32()?,
+        },
+        9 => Stmt::Declarations {
+            stmts_start: r.u32()?,
+            stmts_count: r.u32()?,
+        },
+        10 => Stmt::Return(ExprId(r.u32()?)),
+        11 => Stmt::Break,
+        12 => Stmt::Continue,
+        13 => Stmt::Function {
+            name: StrId(r.u32()?),
+            params_start: r.u32()?,
+            params_count: r.u16()?,
+            body: StmtId(r.u32()?),
+        },
+        tag => return Err(JSError::Message(format!("snapshot: bad stmt tag {tag}"))),
+    })
+}
+
+fn write_pattern(w: &mut ByteWriter, p: &Pattern) {
+    match p {
+        Pattern::Wildcard => w.u8(0),
+        Pattern::Literal(e) => {
+            w.u8(1);
+            w.u32(e.0);
+        }
+        Pattern::Var(s) => {
+            w.u8(2);
+            w.u32(s.0);
+        }
+        Pattern::Array {
+            elems_start,
+            elems_count,
+        } => {
+            w.u8(3);
+            w.u32(*elems_start);
+            w.u16(*elems_count);
+        }
+        Pattern::Object {
+            fields_start,
+            fields_count,
+        } => {
+            w.u8(4);
+            w.u32(*fields_start);
+            w.u16(*fields_count);
+        }
+    }
+}
+
+fn read_pattern(r: &mut ByteReader) -> Result<Pattern> {
+    Ok(match r.u8()? {
+        0 => Pattern::Wildcard,
+        1 => Pattern::Literal(ExprId(r.u32()?)),
+        2 => Pattern::Var(StrId(r.u32()?)),
+        3 => Pattern::Array {
+            elems_start: r.u32()?,
+            elems_count: r.u16()?,
+        },
+        4 => Pattern::Object {
+            fields_start: r.u32()?,
+            fields_count: r.u16()?,
+        },
+        tag => return Err(JSError::Message(format!("snapshot: bad pattern tag {tag}"))),
+    })
+}
+
+fn write_ast(w: &mut ByteWriter, ast: &AstArena) {
+    w.u32(ast.exprs.len() as u32);
+    for e in &ast.exprs {
+        write_expr(w, e);
+    }
+    w.u32(ast.stmts.len() as u32);
+    for s in &ast.stmts {
+        write_stmt(w, s);
+    }
+    w.u32(ast.patterns.len() as u32);
+    for p in &ast.patterns {
+        write_pattern(w, p);
+    }
+    w.u32(ast.expr_lists.len() as u32);
+    for e in &ast.expr_lists {
+        w.u32(e.0);
+    }
+    w.u32(ast.stmt_lists.len() as u32);
+    for s in &ast.stmt_lists {
+        w.u32(s.0);
+    }
+    w.u32(ast.param_lists.len() as u32);
+    for p in &ast.param_lists {
+        w.u32(p.0);
+    }
+    w.u32(ast.prop_lists.len() as u32);
+    for p in &ast.prop_lists {
+        w.u32(p.key.0);
+        w.u32(p.value.0);
+    }
+    w.u32(ast.pattern_lists.len() as u32);
+    for p in &ast.pattern_lists {
+        w.u32(p.0);
+    }
+    w.u32(ast.pattern_fields.len() as u32);
+    for f in &ast.pattern_fields {
+        w.u32(f.key.0);
+        w.u32(f.pattern.0);
+    }
+    w.u32(ast.arms.len() as u32);
+    for a in &ast.arms {
+        w.u32(a.pattern.0);
+        w.u32(a.guard.0);
+        w.u32(a.body.0);
+    }
+    w.u32(ast.effect_clauses.len() as u32);
+    for c in &ast.effect_clauses {
+        w.u32(c.effect.0);
+        w.u32(c.params_start);
+        w.u16(c.params_count);
+        w.u32(c.body.0);
+    }
+    w.u32(ast.floats.len() as u32);
+    for f in &ast.floats {
+        w.f64(*f);
+    }
+    w.u32(ast.root_start);
+    w.u32(ast.root_count);
+}
+
+fn read_ast(r: &mut ByteReader) -> Result<AstArena> {
+    let mut ast = AstArena::new();
+
+    let n = r.u32()? as usize;
+    ast.exprs = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        ast.exprs.push(read_expr(r)?);
+    }
+
+    let n = r.u32()? as usize;
+    ast.stmts = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        ast.stmts.push(read_stmt(r)?);
+    }
+
+    let n = r.u32()? as usize;
+    ast.patterns = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        ast.patterns.push(read_pattern(r)?);
+    }
+
+    let n = r.u32()? as usize;
+    ast.expr_lists = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        ast.expr_lists.push(ExprId(r.u32()?));
+    }
+
+    let n = r.u32()? as usize;
+    ast.stmt_lists = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        ast.stmt_lists.push(StmtId(r.u32()?));
+    }
+
+    let n = r.u32()? as usize;
+    ast.param_lists = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        ast.param_lists.push(StrId(r.u32()?));
+    }
+
+    let n = r.u32()? as usize;
+    ast.prop_lists = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        let key = StrId(r.u32()?);
+        let value = ExprId(r.u32()?);
+        ast.prop_lists.push(PropEntry { key, value });
+    }
+
+    let n = r.u32()? as usize;
+    ast.pattern_lists = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        ast.pattern_lists.push(PatternId(r.u32()?));
+    }
+
+    let n = r.u32()? as usize;
+    ast.pattern_fields = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        let key = StrId(r.u32()?);
+        let pattern = PatternId(r.u32()?);
+        ast.pattern_fields.push(PatternField { key, pattern });
+    }
+
+    let n = r.u32()? as usize;
+    ast.arms = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        let pattern = PatternId(r.u32()?);
+        let guard = ExprId(r.u32()?);
+        let body = ExprId(r.u32()?);
+        ast.arms.push(MatchArm {
+            pattern,
+            guard,
+            body,
+        });
+    }
+
+    let n = r.u32()? as usize;
+    ast.effect_clauses = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        let effect = StrId(r.u32()?);
+        let params_start = r.u32()?;
+        let params_count = r.u16()?;
+        let body = ExprId(r.u32()?);
+        ast.effect_clauses.push(EffectClause {
+            effect,
+            params_start,
+            params_count,
+            body,
+        });
+    }
+
+    let n = r.u32()? as usize;
+    ast.floats = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        ast.floats.push(r.f64()?);
+    }
+
+    ast.root_start = r.u32()?;
+    ast.root_count = r.u32()?;
+
+    Ok(ast)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ast_round_trips_through_bytes() {
+        use crate::parser::Parser;
+
+        let parser =
+            Parser::new("function f(x) { return match (x) { {ok} => ok, _ => 0 } } f({ok: 5})")
+                .unwrap();
+        let (ast, _strings) = parser.parse_program().unwrap();
+
+        let mut w = ByteWriter::new();
+        write_ast(&mut w, &ast);
+        let bytes = w.finish();
+        let mut r = ByteReader::new(&bytes);
+        let ast2 = read_ast(&mut r).unwrap();
+        assert!(r.is_at_end());
+        assert_eq!(ast2.exprs.len(), ast.exprs.len());
+        assert_eq!(ast2.stmts.len(), ast.stmts.len());
+        assert_eq!(ast2.root_start, ast.root_start);
+        assert_eq!(ast2.root_count, ast.root_count);
+    }
+
+    #[test]
+    fn kont_round_trips() {
+        use crate::cont::Kont;
+
+        let k = Kont::ArgsK {
+            callee: crate::JSValue::Function(crate::ObjId(2)),
+            done: vec![crate::JSValue::Int(1)],
+            args_start: 5,
+            args_idx: 1,
+            args_count: 2,
+            env: crate::EnvId::new(0),
+            k: crate::ContId::new(0),
+        };
+        let mut w = ByteWriter::new();
+        write_kont(&mut w, &k);
+        let bytes = w.finish();
+        let mut r = ByteReader::new(&bytes);
+        assert_eq!(read_kont(&mut r).unwrap(), k);
+        assert!(r.is_at_end());
+    }
 
     #[test]
     fn primitives_round_trip() {
@@ -853,5 +2224,511 @@ mod tests {
         assert_eq!(pool2.get(b), Some("beta"));
         assert_eq!(empty, StrId(0));
         assert!(r.is_at_end());
+    }
+
+    #[test]
+    fn binary_and_unary_op_round_trip() {
+        let bin_ops = [
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Div,
+            BinaryOp::Mod,
+            BinaryOp::Pow,
+            BinaryOp::Eq,
+            BinaryOp::Ne,
+            BinaryOp::Lt,
+            BinaryOp::Le,
+            BinaryOp::Gt,
+            BinaryOp::Ge,
+            BinaryOp::And,
+            BinaryOp::Or,
+            BinaryOp::BitAnd,
+            BinaryOp::BitOr,
+            BinaryOp::BitXor,
+            BinaryOp::Shl,
+            BinaryOp::Shr,
+            BinaryOp::UShr,
+            BinaryOp::NullishCoalesce,
+        ];
+        let mut w = ByteWriter::new();
+        for op in bin_ops {
+            write_binary_op(&mut w, op);
+        }
+        let unary_ops = [
+            UnaryOp::Neg,
+            UnaryOp::Not,
+            UnaryOp::BitNot,
+            UnaryOp::TypeOf,
+            UnaryOp::Plus,
+            UnaryOp::PreInc,
+            UnaryOp::PreDec,
+            UnaryOp::PostInc,
+            UnaryOp::PostDec,
+        ];
+        for op in unary_ops {
+            write_unary_op(&mut w, op);
+        }
+        let bytes = w.finish();
+        let mut r = ByteReader::new(&bytes);
+        for op in bin_ops {
+            assert_eq!(read_binary_op(&mut r).unwrap(), op);
+        }
+        for op in unary_ops {
+            assert_eq!(read_unary_op(&mut r).unwrap(), op);
+        }
+        assert!(r.is_at_end());
+
+        let mut bad = ByteWriter::new();
+        bad.u8(99);
+        let bad_bytes = bad.finish();
+        assert!(read_binary_op(&mut ByteReader::new(&bad_bytes)).is_err());
+        assert!(read_unary_op(&mut ByteReader::new(&bad_bytes)).is_err());
+    }
+
+    #[test]
+    fn all_kont_variants_round_trip() {
+        let e = ExprId(1);
+        let e2 = ExprId(2);
+        let e3 = ExprId(3);
+        let s = StmtId(1);
+        let s2 = StmtId(2);
+        let env = EnvId::new(1);
+        let k = ContId::new(1);
+        let name = StrId(1);
+
+        let variants = vec![
+            Kont::Halt,
+            Kont::UnaryK {
+                op: UnaryOp::Neg,
+                k,
+            },
+            Kont::BinaryLeftK {
+                op: BinaryOp::Add,
+                right: e,
+                env,
+                k,
+            },
+            Kont::BinaryRightK {
+                op: BinaryOp::Sub,
+                left: JSValue::Int(4),
+                k,
+            },
+            Kont::AndK { right: e, env, k },
+            Kont::OrK { right: e, env, k },
+            Kont::NullishK { right: e, env, k },
+            Kont::MemberK { property: name, k },
+            Kont::IndexObjK { index: e, env, k },
+            Kont::IndexKeyK {
+                obj: JSValue::Undefined,
+                k,
+            },
+            Kont::AssignVarK { name, env, k },
+            Kont::UpdateVarK {
+                name,
+                is_pre: true,
+                is_inc: false,
+                env,
+                k,
+            },
+            Kont::AssignMemberObjK {
+                property: name,
+                value: e,
+                env,
+                k,
+            },
+            Kont::AssignMemberValK {
+                obj: JSValue::Bool(true),
+                property: name,
+                k,
+            },
+            Kont::AssignIndexObjK {
+                index: e,
+                value: e2,
+                env,
+                k,
+            },
+            Kont::AssignIndexKeyK {
+                obj: JSValue::Bool(false),
+                value: e,
+                env,
+                k,
+            },
+            Kont::AssignIndexValK {
+                obj: JSValue::Int(1),
+                key: JSValue::Int(2),
+                k,
+            },
+            Kont::IfK {
+                consequent: s,
+                alternate: s2,
+                env,
+                k,
+            },
+            Kont::CondK {
+                consequent: e,
+                alternate: e2,
+                env,
+                k,
+            },
+            Kont::WhileK {
+                test: e,
+                body: s,
+                env,
+                k,
+            },
+            Kont::WhileBodyK {
+                test: e,
+                body: s,
+                env,
+                k,
+            },
+            Kont::ForTestK {
+                test: e,
+                update: e2,
+                body: s,
+                env,
+                k,
+            },
+            Kont::ForTestResultK {
+                test: e,
+                update: e2,
+                body: s,
+                env,
+                k,
+            },
+            Kont::ForBodyK {
+                test: e,
+                update: e2,
+                body: s,
+                env,
+                k,
+            },
+            Kont::ForUpdateK {
+                test: e,
+                update: e2,
+                body: s,
+                env,
+                k,
+            },
+            Kont::CalleeK {
+                args_start: 3,
+                args_count: 4,
+                env,
+                k,
+            },
+            Kont::ArgsK {
+                callee: JSValue::Function(ObjId(2)),
+                done: vec![JSValue::Int(1)],
+                args_start: 5,
+                args_idx: 1,
+                args_count: 2,
+                env,
+                k,
+            },
+            Kont::ReturnK { env, k },
+            Kont::ReturnExprK { k },
+            Kont::ArrayK {
+                done: vec![JSValue::Int(9)],
+                elems_start: 1,
+                elems_idx: 0,
+                elems_count: 3,
+                env,
+                k,
+            },
+            Kont::ObjectK {
+                done: vec![(name, JSValue::Int(7))],
+                props_start: 2,
+                props_idx: 1,
+                props_count: 5,
+                env,
+                k,
+            },
+            Kont::LetK { name, env, k },
+            Kont::ConstK { name, env, k },
+            Kont::VarK { name, env, k },
+            Kont::SeqK {
+                stmts_start: 1,
+                stmts_idx: 2,
+                stmts_count: 3,
+                env,
+                k,
+            },
+            Kont::ExprStmtK { k },
+            Kont::BlockK {
+                stmts_start: 1,
+                stmts_idx: 2,
+                stmts_count: 3,
+                final_expr: e,
+                env,
+                k,
+            },
+            Kont::MatchK {
+                arms_start: 1,
+                arms_idx: 0,
+                arms_count: 2,
+                env,
+                k,
+            },
+            Kont::HandlerK {
+                clauses_start: 1,
+                clauses_count: 2,
+                env,
+                return_body: e,
+                return_param: name,
+                k,
+            },
+            Kont::PerformArgsK {
+                effect: name,
+                done: vec![JSValue::Int(6)],
+                args_start: 1,
+                args_idx: 0,
+                args_count: 2,
+                env,
+                k,
+            },
+            Kont::HandleWithK { body: e3, env, k },
+        ];
+
+        assert_eq!(variants.len(), 41, "expected all 41 Kont variants covered");
+
+        for variant in &variants {
+            let mut w = ByteWriter::new();
+            write_kont(&mut w, variant);
+            let bytes = w.finish();
+            let mut r = ByteReader::new(&bytes);
+            let decoded = read_kont(&mut r).unwrap();
+            assert_eq!(&decoded, variant);
+            assert!(r.is_at_end());
+        }
+
+        let mut bad = ByteWriter::new();
+        bad.u8(200);
+        let bad_bytes = bad.finish();
+        assert!(read_kont(&mut ByteReader::new(&bad_bytes)).is_err());
+    }
+
+    #[test]
+    fn all_expr_variants_round_trip() {
+        let e = ExprId(1);
+        let e2 = ExprId(2);
+        let e3 = ExprId(3);
+        let s = StmtId(1);
+        let name = StrId(1);
+
+        let variants = vec![
+            Expr::Empty,
+            Expr::Undefined,
+            Expr::Null,
+            Expr::Bool(true),
+            Expr::Int(42),
+            Expr::Float(3),
+            Expr::String(name),
+            Expr::Identifier(name),
+            Expr::Binary {
+                op: BinaryOp::Add,
+                left: e,
+                right: e2,
+            },
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand: e,
+            },
+            Expr::Call {
+                callee: e,
+                args_start: 1,
+                args_count: 2,
+            },
+            Expr::Member {
+                object: e,
+                property: name,
+            },
+            Expr::Index {
+                object: e,
+                index: e2,
+            },
+            Expr::Assign {
+                target: e,
+                value: e2,
+            },
+            Expr::Conditional {
+                test: e,
+                consequent: e2,
+                alternate: e3,
+            },
+            Expr::Array {
+                elems_start: 1,
+                elems_count: 2,
+            },
+            Expr::Object {
+                props_start: 1,
+                props_count: 2,
+            },
+            Expr::Function {
+                name,
+                params_start: 1,
+                params_count: 2,
+                body: s,
+            },
+            Expr::Handler {
+                clauses_start: 1,
+                clauses_count: 2,
+                return_param: name,
+                return_body: e,
+            },
+            Expr::Arrow {
+                params_start: 1,
+                params_count: 2,
+                body: e,
+                is_block: true,
+            },
+            Expr::This,
+            Expr::Block {
+                stmts_start: 1,
+                stmts_count: 2,
+                final_expr: e,
+            },
+            Expr::Match {
+                scrutinee: e,
+                arms_start: 1,
+                arms_count: 2,
+            },
+            Expr::Perform {
+                effect: name,
+                args_start: 1,
+                args_count: 2,
+            },
+            Expr::Handle {
+                body: e,
+                clauses_start: 1,
+                clauses_count: 2,
+                return_param: name,
+                return_body: e2,
+            },
+            Expr::HandleWith {
+                body: e,
+                handler: e2,
+            },
+        ];
+
+        assert_eq!(variants.len(), 26, "expected all 26 Expr variants covered");
+
+        for variant in &variants {
+            let mut w = ByteWriter::new();
+            write_expr(&mut w, variant);
+            let bytes = w.finish();
+            let mut r = ByteReader::new(&bytes);
+            let decoded = read_expr(&mut r).unwrap();
+            let mut w2 = ByteWriter::new();
+            write_expr(&mut w2, &decoded);
+            assert_eq!(w2.finish(), bytes);
+            assert!(r.is_at_end());
+        }
+
+        let mut bad = ByteWriter::new();
+        bad.u8(200);
+        let bad_bytes = bad.finish();
+        assert!(read_expr(&mut ByteReader::new(&bad_bytes)).is_err());
+    }
+
+    #[test]
+    fn all_stmt_variants_round_trip() {
+        let e = ExprId(1);
+        let s = StmtId(1);
+        let s2 = StmtId(2);
+        let s3 = StmtId(3);
+        let name = StrId(1);
+
+        let variants = vec![
+            Stmt::Empty,
+            Stmt::Expr(e),
+            Stmt::Let { name, init: e },
+            Stmt::Const { name, init: e },
+            Stmt::Var { name, init: e },
+            Stmt::If {
+                test: e,
+                consequent: s,
+                alternate: s2,
+            },
+            Stmt::While { test: e, body: s },
+            Stmt::For {
+                init: s,
+                test: e,
+                update: e,
+                body: s2,
+            },
+            Stmt::Block {
+                stmts_start: 1,
+                stmts_count: 2,
+            },
+            Stmt::Declarations {
+                stmts_start: 1,
+                stmts_count: 2,
+            },
+            Stmt::Return(e),
+            Stmt::Break,
+            Stmt::Continue,
+            Stmt::Function {
+                name,
+                params_start: 1,
+                params_count: 2,
+                body: s3,
+            },
+        ];
+
+        assert_eq!(variants.len(), 14, "expected all 14 Stmt variants covered");
+
+        for variant in &variants {
+            let mut w = ByteWriter::new();
+            write_stmt(&mut w, variant);
+            let bytes = w.finish();
+            let mut r = ByteReader::new(&bytes);
+            let decoded = read_stmt(&mut r).unwrap();
+            let mut w2 = ByteWriter::new();
+            write_stmt(&mut w2, &decoded);
+            assert_eq!(w2.finish(), bytes);
+            assert!(r.is_at_end());
+        }
+
+        let mut bad = ByteWriter::new();
+        bad.u8(200);
+        let bad_bytes = bad.finish();
+        assert!(read_stmt(&mut ByteReader::new(&bad_bytes)).is_err());
+    }
+
+    #[test]
+    fn all_pattern_variants_round_trip() {
+        let variants = vec![
+            Pattern::Wildcard,
+            Pattern::Literal(ExprId(1)),
+            Pattern::Var(StrId(1)),
+            Pattern::Array {
+                elems_start: 1,
+                elems_count: 2,
+            },
+            Pattern::Object {
+                fields_start: 1,
+                fields_count: 2,
+            },
+        ];
+
+        assert_eq!(variants.len(), 5, "expected all 5 Pattern variants covered");
+
+        for variant in &variants {
+            let mut w = ByteWriter::new();
+            write_pattern(&mut w, variant);
+            let bytes = w.finish();
+            let mut r = ByteReader::new(&bytes);
+            let decoded = read_pattern(&mut r).unwrap();
+            let mut w2 = ByteWriter::new();
+            write_pattern(&mut w2, &decoded);
+            assert_eq!(w2.finish(), bytes);
+            assert!(r.is_at_end());
+        }
+
+        let mut bad = ByteWriter::new();
+        bad.u8(200);
+        let bad_bytes = bad.finish();
+        assert!(read_pattern(&mut ByteReader::new(&bad_bytes)).is_err());
     }
 }
