@@ -11,6 +11,8 @@ pub enum JSError {
     ReferenceError(ReferenceError),
     RangeError(RangeError),
     InternalError(&'static str),
+    /// Owned-message error: snapshot failures and restored fiber errors.
+    Message(String),
     OutOfMemory,
     StackOverflow,
 }
@@ -98,6 +100,7 @@ impl fmt::Display for JSError {
             JSError::ReferenceError(e) => write!(f, "ReferenceError: {} is not defined", e.name),
             JSError::RangeError(e) => write!(f, "RangeError: {}", e.message),
             JSError::InternalError(msg) => write!(f, "InternalError: {}", msg),
+            JSError::Message(msg) => write!(f, "{}", msg),
             JSError::OutOfMemory => write!(f, "OutOfMemory"),
             JSError::StackOverflow => write!(f, "StackOverflow"),
         }
@@ -108,5 +111,16 @@ impl fmt::Display for JSError {
 impl From<&'static str> for JSError {
     fn from(msg: &'static str) -> Self {
         JSError::InternalError(msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_variant_displays_its_string() {
+        let e = JSError::Message("snapshot: bad magic".to_string());
+        assert_eq!(e.to_string(), "snapshot: bad magic");
     }
 }

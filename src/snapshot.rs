@@ -57,7 +57,7 @@ impl ByteWriter {
 }
 
 fn truncated() -> JSError {
-    JSError::InternalError("snapshot: truncated input")
+    JSError::Message("snapshot: truncated input".to_string())
 }
 
 impl<'a> ByteReader<'a> {
@@ -107,7 +107,7 @@ impl<'a> ByteReader<'a> {
         let len = self.u32()? as usize;
         let bytes = self.take(len)?;
         String::from_utf8(bytes.to_vec())
-            .map_err(|_| JSError::InternalError("snapshot: invalid UTF-8"))
+            .map_err(|_| JSError::Message("snapshot: invalid UTF-8".to_string()))
     }
 
     pub fn is_at_end(&self) -> bool {
