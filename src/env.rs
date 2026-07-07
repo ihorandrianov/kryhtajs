@@ -262,6 +262,10 @@ impl EnvArena {
 
     /// Rebuild from a deserialized arena; slot 0 is the global env.
     pub fn from_arena(arena: Arena<Env>) -> Self {
+        debug_assert!(
+            !arena.slots().is_empty(),
+            "EnvArena::from_arena: missing global env at slot 0"
+        );
         Self {
             arena,
             global: ArenaId::new(0),

@@ -426,6 +426,10 @@ impl ContArena {
 
     /// Rebuild from a deserialized arena; slot 0 is the halt continuation.
     pub fn from_arena(arena: Arena<Kont>) -> Self {
+        debug_assert!(
+            !arena.slots().is_empty(),
+            "ContArena::from_arena: missing halt cont at slot 0"
+        );
         Self {
             arena,
             halt: ArenaId::new(0),
