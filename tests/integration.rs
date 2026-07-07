@@ -237,3 +237,42 @@ fn test_effects() {
 fn test_handlers() {
     run_test_file(include_str!("fixtures/test_handlers.js"), "handlers");
 }
+
+#[test]
+fn test_snapshot_saved_and_restored() {
+    let dir = std::env::temp_dir().join("kryhta_snap_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("basic.snap");
+    let path_str = path.to_str().unwrap();
+
+    let source = format!(
+        r#"
+        var log = [];
+        var state = {{ count: 41 }};
+        let outcome = perform Snapshot!("{path_str}");
+        state.count = state.count + 1;
+        outcome
+        "#
+    );
+
+    let mut runtime = Runtime::new();
+    let first = eval(&mut runtime, &source).unwrap();
+    assert_eq!(runtime.interpreter.to_string(first), "saved");
+
+    let bytes = std::fs::read(&path).unwrap();
+    let mut restored = Runtime::from_snapshot(&bytes).unwrap();
+    let second = restored.run_resumed().unwrap();
+    assert_eq!(restored.interpreter.to_string(second), "restored");
+    // the increment after the snapshot ran again in the restored world
+    assert_eq!(
+        restored.eval("state.count").unwrap(),
+        JSValue::Int(42),
+        "restored run continues from the snapshot point"
+    );
+}
+
+#[test]
+fn test_snapshot_requires_string_path() {
+    let mut runtime = Runtime::new();
+    assert!(eval(&mut runtime, "perform Snapshot!(42)").is_err());
+}

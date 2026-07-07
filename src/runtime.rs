@@ -266,6 +266,7 @@ impl Runtime {
             "Fork" => self.handle_fork(args, ast),
             "Join" => self.handle_join(args),
             "Gc" => self.handle_gc(),
+            "Snapshot" => self.handle_snapshot(args, ast),
             _ => Err(JSError::runtime_error("Unknown effect")),
         }
     }
@@ -367,6 +368,45 @@ impl Runtime {
     fn handle_gc(&mut self) -> Result<EffectResult> {
         self.gc.collect(&mut self.interpreter, &self.fibers);
         self.interpreter.control = Control::Value(JSValue::Undefined);
+        Ok(EffectResult::Resume)
+    }
+
+    fn handle_snapshot(&mut self, args: Vec<JSValue>, ast: &AstArena) -> Result<EffectResult> {
+        let JSValue::String(path_id) = args.first().copied().unwrap_or(JSValue::Undefined) else {
+            return Err(JSError::type_error("Snapshot: expected file path string"));
+        };
+        let path = self
+            .interpreter
+            .strings
+            .get(path_id)
+            .unwrap_or("")
+            .to_string();
+
+        let restored = self.interpreter.strings.intern("restored");
+        let saved = self.interpreter.strings.intern("saved");
+        let fiber_id = self.current.expect("No current fiber for Snapshot");
+
+        // The file must contain a machine that wakes up seeing "restored".
+        self.interpreter.control = Control::Value(JSValue::String(restored));
+        self.save_current_fiber_state();
+
+        let mut ready = self.ready_queue.clone();
+        ready.push_front(fiber_id);
+
+        // `eval`/`run_resumed` move the session AST out of `self.ast` into a
+        // local for the duration of the run (to satisfy the borrow checker),
+        // passing it down to us as `ast`. `write_runtime` serializes
+        // `rt.ast`, so without this it would snapshot an empty arena.
+        // Restore it just for the write, then empty it again to preserve
+        // that invariant for the rest of the run.
+        self.ast = ast.clone();
+        let bytes = crate::snapshot::write_runtime(self, &ready);
+        self.ast = AstArena::new();
+        std::fs::write(&path, &bytes)
+            .map_err(|e| JSError::Message(format!("Snapshot: cannot write {path}: {e}")))?;
+
+        // The live run continues, seeing "saved".
+        self.interpreter.control = Control::Value(JSValue::String(saved));
         Ok(EffectResult::Resume)
     }
 
