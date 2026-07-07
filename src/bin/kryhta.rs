@@ -2,7 +2,6 @@
 //!
 //! Uses Runtime with CEKH machine for direct AST interpretation.
 
-use kryhta::parser::Parser;
 use kryhta::{JSError, JSValue, Result, Runtime};
 
 use std::io::{self, BufRead, Write};
@@ -63,12 +62,7 @@ fn repl() -> Result<()> {
 }
 
 fn eval_line(runtime: &mut Runtime, source: &str) -> Result<JSValue> {
-    let strings = std::mem::take(&mut runtime.interpreter.strings);
-    let parser = Parser::with_strings(source, strings)?;
-    let (arena, strings) = parser.parse_program()?;
-    runtime.interpreter.strings = strings;
-
-    runtime.run(&arena)
+    runtime.eval(source)
 }
 
 fn run(source: &str) -> Result<()> {

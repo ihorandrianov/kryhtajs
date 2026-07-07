@@ -1,15 +1,14 @@
 //! Integration tests for KryhtaJS
 
-use kryhta::parser::Parser;
-use kryhta::{CEKH, JSValue, Result};
+use kryhta::{JSValue, Result, Runtime};
+
+fn eval(runtime: &mut Runtime, source: &str) -> Result<JSValue> {
+    runtime.eval(source)
+}
 
 fn run_js(source: &str) -> Result<JSValue> {
-    let mut machine = CEKH::new();
-    let strings = std::mem::take(&mut machine.strings);
-    let parser = Parser::with_strings(source, strings)?;
-    let (arena, strings) = parser.parse_program()?;
-    machine.strings = strings;
-    machine.run(&arena)
+    let mut runtime = Runtime::new();
+    eval(&mut runtime, source)
 }
 
 fn run_test_file(source: &str, name: &str) {
@@ -25,6 +24,160 @@ fn run_test_file(source: &str, name: &str) {
             panic!("{}: {}", name, e);
         }
     }
+}
+
+#[test]
+fn test_runtime_consecutive_runs() {
+    let mut runtime = Runtime::new();
+    assert_eq!(eval(&mut runtime, "1 + 1").unwrap(), JSValue::Int(2));
+    assert_eq!(eval(&mut runtime, "2 + 2").unwrap(), JSValue::Int(4));
+}
+
+#[test]
+fn test_runtime_globals_persist_across_runs() {
+    let mut runtime = Runtime::new();
+    eval(&mut runtime, "let x = 5").unwrap();
+    assert_eq!(eval(&mut runtime, "x * 2").unwrap(), JSValue::Int(10));
+}
+
+#[test]
+fn test_functions_persist_across_evals() {
+    let mut runtime = Runtime::new();
+    runtime.eval("function inc(x) { return x + 1 }").unwrap();
+    assert_eq!(runtime.eval("inc(41)").unwrap(), JSValue::Int(42));
+}
+
+#[test]
+fn test_eval_survives_syntax_error() {
+    let mut runtime = Runtime::new();
+    runtime.eval("let msg = 'hello'").unwrap();
+    assert!(runtime.eval("let ] nonsense").is_err());
+    assert_eq!(
+        runtime.eval("msg === 'hello'").unwrap(),
+        JSValue::Bool(true),
+        "session state must survive a failed parse"
+    );
+}
+
+#[test]
+fn test_gc_effect_collects_and_resumes() {
+    run_test_file("perform Gc!(); true", "gc_effect");
+}
+
+#[test]
+fn test_gc_preserves_globals() {
+    run_test_file(include_str!("fixtures/test_gc_globals.js"), "gc_globals");
+}
+
+#[test]
+fn test_gc_preserves_fiber_results() {
+    run_test_file(
+        include_str!("fixtures/test_gc_fiber_results.js"),
+        "gc_fiber_results",
+    );
+}
+
+#[test]
+fn test_gc_triggers_automatically() {
+    let source = r#"
+        let i = 0;
+        while (i < 500) {
+            let o = { a: i };
+            let f = perform Fork!(function() { return 0 });
+            perform Join!(f);
+            i = i + 1;
+        }
+        true
+    "#;
+    let mut runtime = Runtime::new();
+    assert_eq!(eval(&mut runtime, source).unwrap(), JSValue::Bool(true));
+    assert!(
+        runtime.gc_stats().collections > 0,
+        "GC never triggered despite allocating past the threshold"
+    );
+}
+
+#[test]
+fn test_fork_body_gets_fresh_scope() {
+    run_test_file(include_str!("fixtures/test_fork_scope.js"), "fork_scope");
+}
+
+#[test]
+fn test_joined_fibers_are_reaped() {
+    let source = r#"
+        let i = 0;
+        while (i < 100) {
+            let f = perform Fork!(function() { return i });
+            perform Join!(f);
+            i = i + 1;
+        }
+        true
+    "#;
+    let mut runtime = Runtime::new();
+    assert_eq!(eval(&mut runtime, source).unwrap(), JSValue::Bool(true));
+    assert_eq!(
+        runtime.fiber_count(),
+        1,
+        "joined fibers should be reaped; only the root fiber remains"
+    );
+}
+
+#[test]
+fn test_match_object_pattern_requires_keys() {
+    run_test_file(
+        r#"
+        let a = match ({err: "boom"}) { {ok} => 1, {err} => 2 };
+        let b = match ({ok: 5}) { {ok} => ok, {err} => 0 };
+        let c = match ({}) { {ok} => 1, {err} => 2, _ => 3 };
+        a === 2 && b === 5 && c === 3
+        "#,
+        "match_object_pattern_requires_keys",
+    );
+}
+
+#[test]
+fn test_exceptions_are_not_in_the_language() {
+    let mut runtime = Runtime::new();
+    assert!(
+        runtime.eval("throw 1").is_err(),
+        "throw must be a syntax error"
+    );
+    assert!(
+        runtime.eval("try { 1 } catch (e) { 2 }").is_err(),
+        "try/catch must be a syntax error"
+    );
+}
+
+#[test]
+fn test_handler_abort_replaces_catch() {
+    run_test_file(
+        r#"
+        let r = handle {
+            perform Fail!("boom");
+            "unreachable"
+        } with {
+            Fail!(msg, resume) -> msg
+        };
+        r === "boom"
+        "#,
+        "handler_abort_replaces_catch",
+    );
+}
+
+#[test]
+fn test_fiber_failure_contained() {
+    run_test_file(
+        include_str!("fixtures/test_fiber_failure_contained.js"),
+        "fiber_failure_contained",
+    );
+}
+
+#[test]
+fn test_join_failed_fiber_throws() {
+    run_test_file(
+        include_str!("fixtures/test_join_failed_fiber.js"),
+        "join_failed_fiber",
+    );
 }
 
 #[test]

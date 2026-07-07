@@ -45,6 +45,7 @@ pub struct Arena<T> {
     data: Vec<T>,
     free_list: Vec<u32>,
     marks: Vec<bool>,
+    allocations: u64,
 }
 
 impl<T> Arena<T> {
@@ -53,6 +54,7 @@ impl<T> Arena<T> {
             data: Vec::new(),
             free_list: Vec::new(),
             marks: Vec::new(),
+            allocations: 0,
         }
     }
 
@@ -61,10 +63,18 @@ impl<T> Arena<T> {
             data: Vec::with_capacity(capacity),
             free_list: Vec::new(),
             marks: Vec::with_capacity(capacity),
+            allocations: 0,
         }
     }
 
+    /// Cumulative allocation count (never reset) — the GC compares
+    /// this against a snapshot to decide when to collect.
+    pub fn allocations(&self) -> u64 {
+        self.allocations
+    }
+
     pub fn alloc(&mut self, value: T) -> ArenaId<T> {
+        self.allocations += 1;
         if let Some(index) = self.free_list.pop() {
             self.data[index as usize] = value;
             self.marks[index as usize] = false;
@@ -149,6 +159,7 @@ impl<T: Clone> Clone for Arena<T> {
             data: self.data.clone(),
             free_list: self.free_list.clone(),
             marks: self.marks.clone(),
+            allocations: self.allocations,
         }
     }
 }

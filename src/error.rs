@@ -13,8 +13,6 @@ pub enum JSError {
     InternalError(&'static str),
     OutOfMemory,
     StackOverflow,
-    Thrown(ThrownValue),
-    UncaughtException(String),
 }
 
 #[derive(Debug, Clone)]
@@ -36,11 +34,6 @@ pub struct ReferenceError {
 
 #[derive(Debug, Clone)]
 pub struct RangeError {
-    pub message: &'static str,
-}
-
-#[derive(Debug, Clone)]
-pub struct ThrownValue {
     pub message: &'static str,
 }
 
@@ -107,8 +100,6 @@ impl fmt::Display for JSError {
             JSError::InternalError(msg) => write!(f, "InternalError: {}", msg),
             JSError::OutOfMemory => write!(f, "OutOfMemory"),
             JSError::StackOverflow => write!(f, "StackOverflow"),
-            JSError::Thrown(e) => write!(f, "Thrown: {}", e.message),
-            JSError::UncaughtException(msg) => write!(f, "UncaughtException: {}", msg),
         }
     }
 }

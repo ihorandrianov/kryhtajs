@@ -2,7 +2,7 @@ use crate::cekh::{CEKH, Control};
 use crate::cont::ContId;
 use crate::env::EnvId;
 use crate::handler::HandlerId;
-use crate::runtime::Fiber;
+use crate::runtime::{Fiber, FiberStatus};
 use crate::string_pool::StrId;
 use crate::value::{JSValue, ObjId};
 
@@ -21,8 +21,9 @@ pub enum WorkItem {
 
 pub struct GC {
     pub stats: GCStats,
-    threshold: usize,
-    allocations_since_gc: usize,
+    threshold: u64,
+    /// interpreter.total_allocations() at the last collection
+    alloc_snapshot: u64,
     work_list: Vec<WorkItem>,
 }
 
@@ -31,23 +32,19 @@ impl GC {
         Self {
             stats: GCStats::default(),
             threshold: 1000,
-            allocations_since_gc: 0,
+            alloc_snapshot: 0,
             work_list: Vec::with_capacity(1000),
         }
     }
 
-    pub fn notify_allocation(&mut self) {
-        self.allocations_since_gc += 1;
-    }
-
-    pub fn should_collect(&self) -> bool {
-        self.allocations_since_gc > self.threshold
+    pub fn should_collect(&self, interpreter: &CEKH) -> bool {
+        interpreter.total_allocations() - self.alloc_snapshot > self.threshold
     }
 
     pub fn collect(&mut self, interpreter: &mut CEKH, fibers: &[Fiber]) {
         self.mark(interpreter, fibers);
         self.sweep(interpreter);
-        self.allocations_since_gc = 0;
+        self.alloc_snapshot = interpreter.total_allocations();
         self.stats.collections += 1;
     }
 
@@ -57,10 +54,7 @@ impl GC {
         let env = interpreter.env;
         let cont = interpreter.cont;
         match &control {
-            Control::Value(v)
-            | Control::Returning(v)
-            | Control::Throwing(v)
-            | Control::Halted(v) => {
+            Control::Value(v) | Control::Returning(v) | Control::Halted(v) => {
                 self.work_list.push(WorkItem::Value(*v));
             }
             Control::Suspend { args, .. } => {
@@ -74,12 +68,15 @@ impl GC {
         self.work_list.push(WorkItem::Env(env));
         self.work_list.push(WorkItem::Cont(cont));
 
+        // `var` declarations and assignments to undeclared names live only
+        // in the globals map — it is a root set of its own.
+        for value in interpreter.globals.values() {
+            self.work_list.push(WorkItem::Value(*value));
+        }
+
         for fiber in fibers {
             match &fiber.control {
-                Control::Value(v)
-                | Control::Returning(v)
-                | Control::Throwing(v)
-                | Control::Halted(v) => {
+                Control::Value(v) | Control::Returning(v) | Control::Halted(v) => {
                     self.work_list.push(WorkItem::Value(*v));
                 }
                 Control::Suspend { args, .. } => {
@@ -92,6 +89,20 @@ impl GC {
 
             self.work_list.push(WorkItem::Env(fiber.env));
             self.work_list.push(WorkItem::Cont(fiber.cont));
+
+            // A completed fiber's result (until joined) and a blocked fiber's
+            // effect args live only in its status.
+            match &fiber.status {
+                FiberStatus::Completed(value) => {
+                    self.work_list.push(WorkItem::Value(*value));
+                }
+                FiberStatus::Blocked { args, .. } => {
+                    for arg in args {
+                        self.work_list.push(WorkItem::Value(*arg));
+                    }
+                }
+                FiberStatus::Ready | FiberStatus::Running | FiberStatus::Failed(_) => {}
+            }
         }
 
         while let Some(item) = self.work_list.pop() {
@@ -199,8 +210,7 @@ impl GC {
                 self.work_list.push(WorkItem::Cont(k));
             }
 
-            Kont::AssignVarK { env, k, .. }
-            | Kont::UpdateVarK { env, k, .. } => {
+            Kont::AssignVarK { env, k, .. } | Kont::UpdateVarK { env, k, .. } => {
                 self.work_list.push(WorkItem::Env(env));
                 self.work_list.push(WorkItem::Cont(k));
             }
@@ -249,7 +259,13 @@ impl GC {
                 self.work_list.push(WorkItem::Cont(k));
             }
 
-            Kont::ArgsK { callee, done, env, k, .. } => {
+            Kont::ArgsK {
+                callee,
+                done,
+                env,
+                k,
+                ..
+            } => {
                 self.work_list.push(WorkItem::Value(callee));
                 for v in done {
                     self.work_list.push(WorkItem::Value(v));
@@ -283,9 +299,7 @@ impl GC {
                 self.work_list.push(WorkItem::Cont(k));
             }
 
-            Kont::LetK { env, k, .. }
-            | Kont::ConstK { env, k, .. }
-            | Kont::VarK { env, k, .. } => {
+            Kont::LetK { env, k, .. } | Kont::ConstK { env, k, .. } | Kont::VarK { env, k, .. } => {
                 self.work_list.push(WorkItem::Env(env));
                 self.work_list.push(WorkItem::Cont(k));
             }
@@ -296,26 +310,6 @@ impl GC {
             }
 
             Kont::ExprStmtK { k } => {
-                self.work_list.push(WorkItem::Cont(k));
-            }
-
-            Kont::TryK { env, k, .. } => {
-                self.work_list.push(WorkItem::Env(env));
-                self.work_list.push(WorkItem::Cont(k));
-            }
-
-            Kont::FinallyK { result, thrown, env, k, .. } => {
-                if let Some(v) = result {
-                    self.work_list.push(WorkItem::Value(v));
-                }
-                if let Some(v) = thrown {
-                    self.work_list.push(WorkItem::Value(v));
-                }
-                self.work_list.push(WorkItem::Env(env));
-                self.work_list.push(WorkItem::Cont(k));
-            }
-
-            Kont::ThrowK { k } => {
                 self.work_list.push(WorkItem::Cont(k));
             }
 
@@ -366,9 +360,7 @@ impl GC {
         use crate::object::ObjectKind;
         let kind_data: Vec<WorkItem> = match &obj.kind {
             ObjectKind::Ordinary => vec![],
-            ObjectKind::Array(arr) => {
-                arr.elements.iter().map(|v| WorkItem::Value(*v)).collect()
-            }
+            ObjectKind::Array(arr) => arr.elements.iter().map(|v| WorkItem::Value(*v)).collect(),
             ObjectKind::Function(func) => {
                 vec![WorkItem::Env(func.env)]
             }

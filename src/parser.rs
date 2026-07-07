@@ -18,12 +18,18 @@ impl<'a> Parser<'a> {
     }
 
     pub fn with_strings(source: &'a str, strings: StringPool) -> Result<Self> {
+        Self::with_state(source, strings, AstArena::new())
+    }
+
+    /// Parse into an existing arena so ids from earlier parses stay valid
+    /// (functions defined in a previous eval keep working).
+    pub fn with_state(source: &'a str, strings: StringPool, arena: AstArena) -> Result<Self> {
         let mut lexer = Lexer::new(source);
         let current = lexer.next_token()?;
         Ok(Self {
             lexer,
             current,
-            arena: AstArena::new(),
+            arena,
             strings,
         })
     }
@@ -90,7 +96,19 @@ impl<'a> Parser<'a> {
                 }
                 Ok(self.arena.alloc_stmt(Stmt::Continue))
             }
-            Token::Throw => self.parse_throw(),
+            // Exceptions are not part of the language: expected failures are
+            // values ({ok}/{err} + match), recoverable ones are effects
+            // (perform/handle), and faults kill the fiber (observed at Join).
+            Token::Throw => Err(JSError::syntax(
+                "'throw' is not supported — return an {err: ...} value or perform an effect",
+                self.lexer.line(),
+                self.lexer.column(),
+            )),
+            Token::Try => Err(JSError::syntax(
+                "'try' is not supported — use 'handle { ... } with { ... }' for recoverable errors",
+                self.lexer.line(),
+                self.lexer.column(),
+            )),
             Token::LBrace => self.parse_block(),
             Token::Semicolon => {
                 self.advance()?;
@@ -312,15 +330,6 @@ impl<'a> Parser<'a> {
             self.advance()?;
         }
         Ok(self.arena.alloc_stmt(Stmt::Return(expr)))
-    }
-
-    fn parse_throw(&mut self) -> Result<StmtId> {
-        self.consume(Token::Throw)?;
-        let expr = self.parse_expression()?;
-        if self.check(&Token::Semicolon) {
-            self.advance()?;
-        }
-        Ok(self.arena.alloc_stmt(Stmt::Throw(expr)))
     }
 
     fn parse_block(&mut self) -> Result<StmtId> {

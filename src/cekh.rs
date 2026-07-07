@@ -34,8 +34,6 @@ pub enum Control {
     Value(JSValue),
     /// Returning from function
     Returning(JSValue),
-    /// Throwing an exception
-    Throwing(JSValue),
     /// Halted - execution complete
     Halted(JSValue),
     /// Suspend - user space effect found
@@ -90,6 +88,14 @@ impl CEKH {
         machine
     }
 
+    /// Cumulative allocations across all GC-managed arenas.
+    pub fn total_allocations(&self) -> u64 {
+        self.objects.allocations()
+            + self.envs.allocations()
+            + self.conts.allocations()
+            + self.handlers.allocations()
+    }
+
     pub fn fresh_exec_setup(&mut self, ast: &AstArena) -> Result<JSValue> {
         let stmts = ast.get_stmt_list(ast.root_start, ast.root_count);
         if stmts.is_empty() {
@@ -137,7 +143,6 @@ impl CEKH {
             Control::Stmt(stmt_id) => self.step_stmt(stmt_id, ast),
             Control::Value(val) => self.apply_cont(val, ast),
             Control::Returning(val) => self.handle_return(val, ast),
-            Control::Throwing(val) => self.handle_throw(val, ast),
             Control::Halted(val) => {
                 self.control = Control::Halted(val);
                 Ok(())
@@ -709,27 +714,6 @@ impl CEKH {
                 self.handle_continue(ast)?;
             }
 
-            Stmt::Throw(expr) => {
-                self.control = Control::Expr(expr);
-                self.cont = self.conts.alloc(Kont::ThrowK { k: self.cont });
-            }
-
-            Stmt::Try {
-                body,
-                catch_param,
-                catch_body,
-                finally_body,
-            } => {
-                self.control = Control::Stmt(body);
-                self.cont = self.conts.alloc(Kont::TryK {
-                    catch_param,
-                    catch_body,
-                    finally_body,
-                    env: self.env,
-                    k: self.cont,
-                });
-            }
-
             Stmt::Function {
                 name,
                 params_start,
@@ -1274,44 +1258,6 @@ impl CEKH {
                 self.cont = k;
             }
 
-            Kont::TryK {
-                finally_body,
-                env,
-                k,
-                ..
-            } => {
-                if finally_body.is_some() {
-                    self.control = Control::Stmt(finally_body);
-                    self.env = env;
-                    self.cont = self.conts.alloc(Kont::FinallyK {
-                        finally_body,
-                        result: Some(val),
-                        thrown: None,
-                        env,
-                        k,
-                    });
-                } else {
-                    self.control = Control::Value(val);
-                    self.cont = k;
-                }
-            }
-
-            Kont::FinallyK {
-                result, thrown, k, ..
-            } => {
-                if let Some(thrown_val) = thrown {
-                    self.control = Control::Throwing(thrown_val);
-                } else {
-                    self.control = Control::Value(result.unwrap_or(JSValue::Undefined));
-                }
-                self.cont = k;
-            }
-
-            Kont::ThrowK { k } => {
-                self.cont = k;
-                self.control = Control::Throwing(val);
-            }
-
             Kont::BlockK {
                 stmts_start,
                 stmts_idx,
@@ -1438,75 +1384,6 @@ impl CEKH {
 
         self.control = Control::Halted(val);
         Ok(())
-    }
-
-    fn handle_throw(&mut self, val: JSValue, _ast: &AstArena) -> Result<()> {
-        let mut k = self.cont;
-        loop {
-            let Some(kont) = self.conts.get(k) else {
-                break;
-            };
-            match kont {
-                Kont::Halt => {
-                    return Err(JSError::UncaughtException(format!("{:?}", val)));
-                }
-                Kont::TryK {
-                    catch_param,
-                    catch_body,
-                    finally_body,
-                    env,
-                    k: outer,
-                } => {
-                    // Extract Copy fields before mutating self
-                    let catch_param = *catch_param;
-                    let catch_body = *catch_body;
-                    let finally_body = *finally_body;
-                    let env = *env;
-                    let outer = *outer;
-
-                    if catch_body.is_some() {
-                        let catch_env = self.envs.bind(env, catch_param, val);
-                        self.control = Control::Stmt(catch_body);
-                        self.env = catch_env;
-
-                        if finally_body.is_some() {
-                            self.cont = self.conts.alloc(Kont::FinallyK {
-                                finally_body,
-                                result: None,
-                                thrown: None,
-                                env,
-                                k: outer,
-                            });
-                        } else {
-                            self.cont = outer;
-                        }
-                    } else if finally_body.is_some() {
-                        self.control = Control::Stmt(finally_body);
-                        self.env = env;
-                        self.cont = self.conts.alloc(Kont::FinallyK {
-                            finally_body,
-                            result: None,
-                            thrown: Some(val),
-                            env,
-                            k: outer,
-                        });
-                    } else {
-                        k = outer;
-                        continue;
-                    }
-                    return Ok(());
-                }
-                _ => {
-                    if let Some(outer) = kont.outer() {
-                        k = outer;
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-
-        Err(JSError::UncaughtException(format!("{:?}", val)))
     }
 
     fn handle_break(&mut self) -> Result<()> {
@@ -2189,7 +2066,11 @@ impl CEKH {
 
                 let mut all_bindings = HashMap::new();
                 for field in fields {
-                    let prop_val = obj.get(field.key).unwrap_or(JSValue::Undefined);
+                    // Structural matching: every key in the pattern must exist
+                    // on the value, so {ok} and {err} arms discriminate.
+                    let Some(prop_val) = obj.get(field.key) else {
+                        return Ok(None);
+                    };
                     match self.match_pattern(field.pattern, prop_val, ast)? {
                         Some(bindings) => all_bindings.extend(bindings),
                         None => return Ok(None),
@@ -2592,33 +2473,6 @@ impl CEKH {
                 k: new_k,
             },
             Kont::ExprStmtK { .. } => Kont::ExprStmtK { k: new_k },
-            Kont::TryK {
-                catch_param,
-                catch_body,
-                finally_body,
-                env,
-                ..
-            } => Kont::TryK {
-                catch_param,
-                catch_body,
-                finally_body,
-                env,
-                k: new_k,
-            },
-            Kont::FinallyK {
-                finally_body,
-                result,
-                thrown,
-                env,
-                ..
-            } => Kont::FinallyK {
-                finally_body,
-                result,
-                thrown,
-                env,
-                k: new_k,
-            },
-            Kont::ThrowK { .. } => Kont::ThrowK { k: new_k },
             Kont::BlockK {
                 stmts_start,
                 stmts_idx,

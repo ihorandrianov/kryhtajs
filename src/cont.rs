@@ -292,29 +292,6 @@ pub enum Kont {
         k: ContId,
     },
 
-    //Error Handling    /// try { body } catch (e) { handler } finally { finally }
-    TryK {
-        catch_param: StrId,
-        catch_body: StmtId,
-        finally_body: StmtId,
-        env: EnvId,
-        k: ContId,
-    },
-
-    /// Finally clause pending
-    FinallyK {
-        finally_body: StmtId,
-        result: Option<JSValue>,
-        thrown: Option<JSValue>,
-        env: EnvId,
-        k: ContId,
-    },
-
-    /// Throw expression - evaluating value to throw
-    ThrowK {
-        k: ContId,
-    },
-
     //Block Expression    /// Block expression - evaluating statements, then final expr
     BlockK {
         stmts_start: u32,
@@ -402,9 +379,6 @@ impl Kont {
             | Kont::VarK { k, .. }
             | Kont::SeqK { k, .. }
             | Kont::ExprStmtK { k, .. }
-            | Kont::TryK { k, .. }
-            | Kont::FinallyK { k, .. }
-            | Kont::ThrowK { k, .. }
             | Kont::BlockK { k, .. }
             | Kont::MatchK { k, .. }
             | Kont::HandlerK { k, .. }
@@ -449,6 +423,10 @@ impl ContArena {
     /// Get the halt continuation
     pub fn halt(&self) -> ContId {
         self.halt
+    }
+
+    pub fn allocations(&self) -> u64 {
+        self.arena.allocations()
     }
 
     /// Allocate a new continuation

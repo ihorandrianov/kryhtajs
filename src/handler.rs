@@ -49,6 +49,10 @@ impl HandlerArena {
         self.arena.alloc(handler)
     }
 
+    pub fn allocations(&self) -> u64 {
+        self.arena.allocations()
+    }
+
     pub fn get(&self, id: HandlerId) -> Option<&Handler> {
         self.arena.get(id)
     }

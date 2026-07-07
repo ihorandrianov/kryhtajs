@@ -302,13 +302,6 @@ pub enum Stmt {
     Return(ExprId),
     Break,
     Continue,
-    Throw(ExprId),
-    Try {
-        body: StmtId,
-        catch_param: StrId,
-        catch_body: StmtId,
-        finally_body: StmtId,
-    },
     Function {
         name: StrId,
         params_start: u32,
@@ -323,6 +316,7 @@ impl Default for Stmt {
     }
 }
 
+#[derive(Clone)]
 pub struct AstArena {
     pub exprs: Vec<Expr>,
     pub stmts: Vec<Stmt>,

@@ -261,6 +261,10 @@ impl EnvArena {
         self.global
     }
 
+    pub fn allocations(&self) -> u64 {
+        self.arena.allocations()
+    }
+
     /// Allocate a new empty environment with parent
     pub fn extend(&mut self, parent: EnvId) -> EnvId {
         self.arena.alloc(Env::with_parent(parent))

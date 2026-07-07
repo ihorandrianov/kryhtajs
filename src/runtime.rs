@@ -1,15 +1,16 @@
 use std::collections::{HashMap, VecDeque};
 
+use crate::Kont;
 use crate::ast::AstArena;
-use crate::cekh::{Control, CEKH};
+use crate::cekh::{CEKH, Control};
 use crate::cont::ContId;
 use crate::env::EnvId;
 use crate::error::{JSError, Result};
 use crate::gc::GC;
-use crate::object::ObjectKind;
+use crate::object::{Object, ObjectKind};
+use crate::parser::Parser;
 use crate::string_pool::StrId;
-use crate::value::JSValue;
-use crate::Kont;
+use crate::value::{JSValue, ObjId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FiberId(pub u32);
@@ -55,6 +56,9 @@ pub struct Runtime {
     next_fiber_id: u32,
     join_waiters: HashMap<FiberId, Vec<FiberId>>,
     gc: GC,
+    /// Session AST — grows across `eval` calls so function bodies from
+    /// earlier evals stay resolvable.
+    ast: AstArena,
 }
 
 impl Runtime {
@@ -67,11 +71,35 @@ impl Runtime {
             next_fiber_id: 0,
             join_waiters: HashMap::new(),
             gc: GC::new(),
+            ast: AstArena::new(),
         }
+    }
+
+    /// Parse and run source against this runtime's persistent session state.
+    /// Parses against clones and commits only on success, so a syntax error
+    /// leaves the session (string pool, AST, globals) intact.
+    pub fn eval(&mut self, source: &str) -> Result<JSValue> {
+        let parser =
+            Parser::with_state(source, self.interpreter.strings.clone(), self.ast.clone())?;
+        let (arena, strings) = parser.parse_program()?;
+        self.interpreter.strings = strings;
+        self.ast = arena;
+
+        let ast = std::mem::take(&mut self.ast);
+        let result = self.run(&ast);
+        self.ast = ast;
+        result
     }
 
     pub fn run(&mut self, ast: &AstArena) -> Result<JSValue> {
         self.interpreter.fresh_exec_setup(ast)?;
+
+        // Each run is a fresh top-level execution: fibers from a previous
+        // run are dead (completed, failed, or abandoned blocked waiters).
+        self.fibers.clear();
+        self.ready_queue.clear();
+        self.join_waiters.clear();
+        self.current = None;
 
         let root_fiber = Fiber {
             id: FiberId(0),
@@ -94,26 +122,34 @@ impl Runtime {
                 }
             }
 
-            match self.run_current_fiber(ast)? {
-                Outcome::Done(value) => {
+            match self.run_current_fiber(ast) {
+                Ok(Outcome::Done(value)) => {
                     if self.current == Some(FiberId(0)) {
                         main_result = value;
                     }
                     self.complete_current_fiber(value);
                     self.current = None;
                 }
-                Outcome::Suspended { effect, args } => {
+                Ok(Outcome::Suspended { effect, args }) => {
                     match self.handle_effect(effect, args, ast)? {
                         EffectResult::Resume => {}
                         EffectResult::Block => {
-                            // TODO: block current fiber, select next
                             self.current = None;
                         }
                         EffectResult::Spawned(id) => {
-                            // TODO: continue current, queue new one
                             self.interpreter.control = Control::Value(JSValue::Int(id.0 as i32));
                         }
                     }
+                }
+                Err(err) => {
+                    // The root fiber's failure is the program's failure;
+                    // a child fiber's failure is contained and surfaces
+                    // as a throw in whoever joins it.
+                    if self.current == Some(FiberId(0)) {
+                        return Err(err);
+                    }
+                    self.fail_current_fiber(err);
+                    self.current = None;
                 }
             }
         }
@@ -159,8 +195,17 @@ impl Runtime {
 
         if let Some(waiters) = self.join_waiters.remove(&fiber_id) {
             for waiter_id in waiters {
-                self.unblock_fiber(waiter_id, value);
+                let result = self.join_result("ok", value);
+                self.unblock_fiber(waiter_id, result);
             }
+            // Result delivered to every joiner — the fiber is consumed.
+            self.remove_fiber(fiber_id);
+        }
+    }
+
+    fn remove_fiber(&mut self, fiber_id: FiberId) {
+        if let Some(pos) = self.fibers.iter().position(|f| f.id == fiber_id) {
+            self.fibers.swap_remove(pos);
         }
     }
 
@@ -192,7 +237,7 @@ impl Runtime {
         args: Vec<JSValue>,
         ast: &AstArena,
     ) -> Result<EffectResult> {
-        if self.gc.should_collect() {
+        if self.gc.should_collect(&self.interpreter) {
             self.gc.collect(&mut self.interpreter, &self.fibers);
         }
 
@@ -202,6 +247,7 @@ impl Runtime {
             "Print" => self.handle_print(args),
             "Fork" => self.handle_fork(args, ast),
             "Join" => self.handle_join(args),
+            "Gc" => self.handle_gc(),
             _ => Err(JSError::runtime_error("Unknown effect")),
         }
     }
@@ -232,18 +278,7 @@ impl Runtime {
         let cont = self.interpreter.conts.alloc(Kont::Halt);
         let env = func_data.env;
 
-        let id = self.get_next_fiber_id();
-        let fiber = Fiber {
-            id,
-            control,
-            cont,
-            env,
-            status: FiberStatus::Ready,
-        };
-
-        self.fibers.push(fiber);
-        self.ready_queue.push_back(id);
-
+        let id = self.spawn_fiber(cont, env, control);
         Ok(EffectResult::Spawned(id))
     }
 
@@ -264,10 +299,19 @@ impl Runtime {
         match &target.status {
             FiberStatus::Completed(value) => {
                 let value = *value;
-                self.interpreter.control = Control::Value(value);
+                let result = self.join_result("ok", value);
+                self.interpreter.control = Control::Value(result);
+                self.remove_fiber(target_id);
                 Ok(EffectResult::Resume)
             }
-            FiberStatus::Failed(err) => Err(err.clone()),
+            FiberStatus::Failed(err) => {
+                let err = err.clone();
+                let err_val = self.error_value(&err);
+                let result = self.join_result("err", err_val);
+                self.interpreter.control = Control::Value(result);
+                self.remove_fiber(target_id);
+                Ok(EffectResult::Resume)
+            }
             _ => {
                 self.join_waiters
                     .entry(target_id)
@@ -294,6 +338,20 @@ impl Runtime {
         fiber.status = FiberStatus::Ready;
     }
 
+    pub fn gc_stats(&self) -> crate::gc::GCStats {
+        self.gc.stats
+    }
+
+    pub fn fiber_count(&self) -> usize {
+        self.fibers.len()
+    }
+
+    fn handle_gc(&mut self) -> Result<EffectResult> {
+        self.gc.collect(&mut self.interpreter, &self.fibers);
+        self.interpreter.control = Control::Value(JSValue::Undefined);
+        Ok(EffectResult::Resume)
+    }
+
     fn handle_print(&mut self, args: Vec<JSValue>) -> Result<EffectResult> {
         let output: Vec<String> = args
             .iter()
@@ -314,6 +372,7 @@ impl Runtime {
     fn fail_current_fiber(&mut self, error: JSError) {
         let fiber_id = self.current.expect("No current fiber to fail");
 
+        let err_val = self.error_value(&error);
         let fiber = self
             .fibers
             .iter_mut()
@@ -321,20 +380,30 @@ impl Runtime {
             .expect("Current fiber should be found");
 
         fiber.status = FiberStatus::Failed(error);
+
+        if let Some(waiters) = self.join_waiters.remove(&fiber_id) {
+            for waiter_id in waiters {
+                let result = self.join_result("err", err_val);
+                self.unblock_fiber(waiter_id, result);
+            }
+            // Error delivered to every joiner — the fiber is consumed.
+            self.remove_fiber(fiber_id);
+        }
     }
 
-    fn block_current_fiber(&mut self, effect: StrId, args: Vec<JSValue>) {
-        let fiber_id = self.current.expect("No current fiber to block");
+    /// A fiber's error, surfaced as a plain JS value in another fiber.
+    fn error_value(&mut self, error: &JSError) -> JSValue {
+        JSValue::String(self.interpreter.strings.intern(&error.to_string()))
+    }
 
-        let fiber = self
-            .fibers
-            .iter_mut()
-            .find(|f| f.id == fiber_id)
-            .expect("Current fiber not found");
-
-        fiber.cont = self.interpreter.cont;
-        fiber.env = self.interpreter.env;
-        fiber.status = FiberStatus::Blocked { effect, args };
+    /// A fiber's fate as a value: {ok: result} or {err: reason}.
+    /// Allocated per receiver so joiners don't alias one wrapper object.
+    fn join_result(&mut self, key: &str, value: JSValue) -> JSValue {
+        let key = self.interpreter.strings.intern(key);
+        let mut obj = Object::new();
+        obj.set(key, value);
+        let id = self.interpreter.objects.alloc(obj);
+        JSValue::Object(ObjId(id.index() as u32))
     }
 
     fn unblock_fiber(&mut self, fiber_id: FiberId, value: JSValue) {
