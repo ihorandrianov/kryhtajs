@@ -9,15 +9,47 @@ use std::io::{self, BufRead, Write};
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() > 1 {
-        let source = std::fs::read_to_string(&args[1])
-            .map_err(|_| JSError::InternalError("Failed to read file"))?;
-        run(&source)?;
-    } else {
-        repl()?;
+    match args.get(1).map(String::as_str) {
+        Some("--resume") => {
+            let path = args
+                .get(2)
+                .ok_or(JSError::InternalError("Usage: kryhta --resume <file.snap>"))?;
+            resume(path)
+        }
+        Some(path) => {
+            let source = std::fs::read_to_string(path)
+                .map_err(|_| JSError::InternalError("Failed to read file"))?;
+            run(&source)
+        }
+        None => repl(),
     }
+}
 
-    Ok(())
+fn resume(path: &str) -> Result<()> {
+    let attempt = std::fs::read(path)
+        .map_err(|e| JSError::Message(format!("snapshot: cannot read {path}: {e}")))
+        .and_then(|bytes| Runtime::from_snapshot(&bytes));
+
+    let mut runtime = match attempt {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    match runtime.run_resumed() {
+        Ok(result) => {
+            if !matches!(result, JSValue::Undefined) {
+                print_value(&result, &runtime);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn repl() -> Result<()> {
