@@ -77,6 +77,26 @@ match (perform Join!(f)) {
 }
 ```
 
+## Durable execution
+
+A running program — including every suspended fiber — can checkpoint itself
+to a self-contained file and be resumed later, even after the process dies:
+
+```javascript
+match (perform Snapshot!("job.snap")) {
+    "saved"    => perform Print!("checkpoint written"),
+    "restored" => perform Print!("welcome back")
+}
+```
+
+```bash
+kryhta job.js              # runs, writes job.snap at the Snapshot! call
+kryhta --resume job.snap   # wakes up inside that call, seeing "restored"
+```
+
+The snapshot contains the whole machine (fibers, heap, continuations, AST),
+so resuming does not need the original source file.
+
 ## License
 
 MIT
