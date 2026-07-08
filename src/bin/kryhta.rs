@@ -10,12 +10,13 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(String::as_str) {
-        Some("--resume") => {
-            let path = args
-                .get(2)
-                .ok_or(JSError::InternalError("Usage: kryhta --resume <file.snap>"))?;
-            resume(path)
-        }
+        Some("--resume") => match args.get(2) {
+            Some(path) => resume(path),
+            None => {
+                eprintln!("Error: Usage: kryhta --resume <file.snap>");
+                std::process::exit(1);
+            }
+        },
         Some(path) => {
             let source = std::fs::read_to_string(path)
                 .map_err(|_| JSError::InternalError("Failed to read file"))?;

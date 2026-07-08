@@ -1983,8 +1983,23 @@ pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
     let ast = read_ast(&mut r)?;
 
     let objects = read_arena(&mut r, read_object)?;
-    let envs = EnvArena::from_arena(read_arena(&mut r, read_env)?);
-    let conts = ContArena::from_arena(read_arena(&mut r, read_kont)?);
+    let env_arena = read_arena(&mut r, read_env)?;
+    let cont_arena = read_arena(&mut r, read_kont)?;
+    // `from_arena` only debug_asserts non-emptiness; a format-valid but
+    // crafted/corrupt snapshot with an empty env or cont section would
+    // otherwise panic debug builds instead of failing gracefully.
+    if env_arena.slots().is_empty() {
+        return Err(JSError::Message(
+            "snapshot: env arena missing global env at slot 0".to_string(),
+        ));
+    }
+    if cont_arena.slots().is_empty() {
+        return Err(JSError::Message(
+            "snapshot: cont arena missing halt cont at slot 0".to_string(),
+        ));
+    }
+    let envs = EnvArena::from_arena(env_arena);
+    let conts = ContArena::from_arena(cont_arena);
     let handlers = HandlerArena::from_arena(read_arena(&mut r, read_handler)?);
 
     let control = read_control(&mut r)?;

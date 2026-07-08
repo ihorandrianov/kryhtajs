@@ -397,13 +397,24 @@ impl Runtime {
         // local for the duration of the run (to satisfy the borrow checker),
         // passing it down to us as `ast`. `write_runtime` serializes
         // `rt.ast`, so without this it would snapshot an empty arena.
-        // Restore it just for the write, then empty it again to preserve
-        // that invariant for the rest of the run.
-        self.ast = ast.clone();
+        // Swap it in just for the write, then restore whatever was there
+        // before (rather than assuming empty) so we don't clobber state a
+        // caller may have left in `self.ast`.
+        let prev_ast = std::mem::replace(&mut self.ast, ast.clone());
         let bytes = crate::snapshot::write_runtime(self, &ready);
-        self.ast = AstArena::new();
-        std::fs::write(&path, &bytes)
-            .map_err(|e| JSError::Message(format!("Snapshot: cannot write {path}: {e}")))?;
+
+        // Write to a temp file and rename so a process kill mid-write can't
+        // truncate/corrupt the last good checkpoint on disk.
+        let tmp_path = format!("{path}.tmp");
+        let write_result = std::fs::write(&tmp_path, &bytes)
+            .map_err(|e| JSError::Message(format!("Snapshot: cannot write {tmp_path}: {e}")))
+            .and_then(|_| {
+                std::fs::rename(&tmp_path, &path).map_err(|e| {
+                    JSError::Message(format!("Snapshot: cannot rename {tmp_path}: {e}"))
+                })
+            });
+        self.ast = prev_ast;
+        write_result?;
 
         // The live run continues, seeing "saved".
         self.interpreter.control = Control::Value(JSValue::String(saved));

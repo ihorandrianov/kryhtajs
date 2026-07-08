@@ -258,6 +258,10 @@ fn test_snapshot_saved_and_restored() {
     let mut runtime = Runtime::new();
     let first = eval(&mut runtime, &source).unwrap();
     assert_eq!(runtime.interpreter.to_string(first), "saved");
+    assert!(
+        !std::path::Path::new(&format!("{path_str}.tmp")).exists(),
+        "temp snapshot file must not linger"
+    );
 
     let bytes = std::fs::read(&path).unwrap();
     let mut restored = Runtime::from_snapshot(&bytes).unwrap();
