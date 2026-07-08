@@ -276,3 +276,25 @@ fn test_snapshot_requires_string_path() {
     let mut runtime = Runtime::new();
     assert!(eval(&mut runtime, "perform Snapshot!(42)").is_err());
 }
+
+#[test]
+fn test_snapshot_round_trip_equivalence() {
+    let dir = std::env::temp_dir().join("kryhta_snap_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fibers.snap");
+    let source = include_str!("fixtures/test_snapshot_fibers.js")
+        .replace("__SNAP_PATH__", path.to_str().unwrap());
+
+    let mut original = Runtime::new();
+    let uninterrupted = eval(&mut original, &source).unwrap();
+    assert_eq!(uninterrupted, JSValue::Int(52));
+
+    let bytes = std::fs::read(&path).unwrap();
+    let mut restored = Runtime::from_snapshot(&bytes).unwrap();
+    let resumed = restored.run_resumed().unwrap();
+    assert_eq!(
+        resumed,
+        JSValue::Int(52),
+        "restored run must produce the identical result"
+    );
+}
