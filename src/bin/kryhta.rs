@@ -28,7 +28,10 @@ fn main() -> Result<()> {
 fn resume(path: &str) -> Result<()> {
     let attempt = std::fs::read(path)
         .map_err(|e| JSError::Message(format!("snapshot: cannot read {path}: {e}")))
-        .and_then(|bytes| Runtime::from_snapshot(&bytes));
+        .and_then(|bytes| {
+            Runtime::from_snapshot(&bytes)
+                .map_err(|e| JSError::Message(format!("snapshot: cannot resume {path}: {e}")))
+        });
 
     let mut runtime = match attempt {
         Ok(rt) => rt,
