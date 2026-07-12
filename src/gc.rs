@@ -126,15 +126,15 @@ impl GC {
                         self.work_list.push(WorkItem::Value(*arg));
                     }
                 }
-                FiberStatus::BlockedOnHost { effect, args } => {
-                    // The effect name and args live only in the status while
-                    // the fiber waits for the host; without these roots a GC
-                    // could sweep them before the host reads the call.
+                FiberStatus::BlockedOnHost { effect, .. } => {
+                    // The effect name lives only in the status while the
+                    // fiber waits for the host; without this root a GC could
+                    // sweep it before the host reads the call. `args` is
+                    // already `HostValue` here (converted at block time), a
+                    // self-contained tree owning its own Strings — it holds
+                    // no arena ids, so there is nothing else to root.
                     self.work_list
                         .push(WorkItem::Value(JSValue::String(*effect)));
-                    for arg in args {
-                        self.work_list.push(WorkItem::Value(*arg));
-                    }
                 }
                 FiberStatus::Ready | FiberStatus::Running | FiberStatus::Failed(_) => {}
             }

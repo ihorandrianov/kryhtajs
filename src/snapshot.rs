@@ -15,6 +15,7 @@ use crate::env::{Env, EnvArena, EnvId};
 use crate::error::{JSError, Result};
 use crate::gc::GC;
 use crate::handler::{Handler, HandlerArena};
+use crate::host::HostValue;
 use crate::object::{
     ArrayData, BoundFunctionData, FunctionData, NativeFn, Object, ObjectKind, Property,
 };
@@ -211,6 +212,96 @@ fn read_seq_values(r: &mut ByteReader) -> Result<Vec<JSValue>> {
     let mut out = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
         out.push(read_value(r)?);
+    }
+    Ok(out)
+}
+
+// HostValue is self-contained (owns its Strings, no arena ids), so unlike
+// `write_value`/`read_value` this codec needs no runtime/interner access.
+fn write_host_value(w: &mut ByteWriter, v: &HostValue) {
+    match v {
+        HostValue::Undefined => w.u8(0),
+        HostValue::Null => w.u8(1),
+        HostValue::Bool(b) => {
+            w.u8(2);
+            w.bool_(*b);
+        }
+        HostValue::Int(n) => {
+            w.u8(3);
+            w.i32(*n);
+        }
+        HostValue::Float(f) => {
+            w.u8(4);
+            w.f64(*f);
+        }
+        HostValue::Str(s) => {
+            w.u8(5);
+            w.str_(s);
+        }
+        HostValue::Array(items) => {
+            w.u8(6);
+            w.u32(items.len() as u32);
+            for item in items {
+                write_host_value(w, item);
+            }
+        }
+        HostValue::Object(pairs) => {
+            w.u8(7);
+            w.u32(pairs.len() as u32);
+            for (key, value) in pairs {
+                w.str_(key);
+                write_host_value(w, value);
+            }
+        }
+    }
+}
+
+fn read_host_value(r: &mut ByteReader) -> Result<HostValue> {
+    Ok(match r.u8()? {
+        0 => HostValue::Undefined,
+        1 => HostValue::Null,
+        2 => HostValue::Bool(r.bool_()?),
+        3 => HostValue::Int(r.i32()?),
+        4 => HostValue::Float(r.f64()?),
+        5 => HostValue::Str(r.str_()?),
+        6 => {
+            let n = r.u32()? as usize;
+            let mut items = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                items.push(read_host_value(r)?);
+            }
+            HostValue::Array(items)
+        }
+        7 => {
+            let n = r.u32()? as usize;
+            let mut pairs = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                let key = r.str_()?;
+                let value = read_host_value(r)?;
+                pairs.push((key, value));
+            }
+            HostValue::Object(pairs)
+        }
+        tag => {
+            return Err(JSError::Message(format!(
+                "snapshot: bad host value tag {tag}"
+            )));
+        }
+    })
+}
+
+fn write_seq_host_values(w: &mut ByteWriter, vs: &[HostValue]) {
+    w.u32(vs.len() as u32);
+    for v in vs {
+        write_host_value(w, v);
+    }
+}
+
+fn read_seq_host_values(r: &mut ByteReader) -> Result<Vec<HostValue>> {
+    let n = r.u32()? as usize;
+    let mut out = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        out.push(read_host_value(r)?);
     }
     Ok(out)
 }
@@ -470,7 +561,7 @@ fn write_fiber_status(w: &mut ByteWriter, s: &FiberStatus) {
         FiberStatus::BlockedOnHost { effect, args } => {
             w.u8(5);
             w.u32(effect.0);
-            write_seq_values(w, args);
+            write_seq_host_values(w, args);
         }
     }
 }
@@ -488,7 +579,7 @@ fn read_fiber_status(r: &mut ByteReader) -> Result<FiberStatus> {
         4 => FiberStatus::Failed(JSError::Message(r.str_()?)),
         5 => {
             let effect = StrId(r.u32()?);
-            let args = read_seq_values(r)?;
+            let args = read_seq_host_values(r)?;
             FiberStatus::BlockedOnHost { effect, args }
         }
         tag => {
@@ -3044,16 +3135,28 @@ mod tests {
             &mut w,
             &FiberStatus::BlockedOnHost {
                 effect: StrId(7),
-                args: vec![JSValue::Int(1), JSValue::Bool(true)],
+                args: vec![
+                    HostValue::Int(1),
+                    HostValue::Bool(true),
+                    HostValue::Array(vec![HostValue::Str("nested".to_string())]),
+                    HostValue::Object(vec![("k".to_string(), HostValue::Null)]),
+                ],
             },
         );
         let bytes = w.finish();
         let mut r = ByteReader::new(&bytes);
-        let FiberStatus::BlockedOnHost { effect, args } = read_fiber_status(&mut r).unwrap()
-        else {
+        let FiberStatus::BlockedOnHost { effect, args } = read_fiber_status(&mut r).unwrap() else {
             panic!("wrong status variant");
         };
         assert_eq!(effect, StrId(7));
-        assert_eq!(args, vec![JSValue::Int(1), JSValue::Bool(true)]);
+        assert_eq!(
+            args,
+            vec![
+                HostValue::Int(1),
+                HostValue::Bool(true),
+                HostValue::Array(vec![HostValue::Str("nested".to_string())]),
+                HostValue::Object(vec![("k".to_string(), HostValue::Null)]),
+            ]
+        );
     }
 }

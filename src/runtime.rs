@@ -21,7 +21,7 @@ pub enum FiberStatus {
     Ready,
     Running,
     Blocked { effect: StrId, args: Vec<JSValue> },
-    BlockedOnHost { effect: StrId, args: Vec<JSValue> },
+    BlockedOnHost { effect: StrId, args: Vec<HostValue> },
     Completed(JSValue),
     Failed(JSError),
 }
@@ -84,8 +84,6 @@ pub struct Runtime {
 
 impl Runtime {
     /// The builtin effect names every runtime understands out of the box.
-    /// Also used by `snapshot::read_runtime` to re-seed a restored runtime's
-    /// registry (full grant persistence is a later task).
     pub(crate) fn builtin_effects(strings: &mut StringPool) -> HashMap<StrId, EffectKind> {
         use BuiltinEffect::*;
         [
@@ -240,7 +238,11 @@ impl Runtime {
     }
 
     /// Pending-call derivation (single source of truth — never stored).
-    fn pending_calls(&self) -> Result<Vec<PendingCall>> {
+    /// Args were already converted to `HostValue` at block time
+    /// (`handle_host_effect`), so this is just a read, not a fallible
+    /// conversion — draining can't fail because of what a sibling fiber did
+    /// to a shared arg after the block.
+    fn pending_calls(&self) -> Vec<PendingCall> {
         let mut calls = Vec::new();
         for fiber in &self.fibers {
             if let FiberStatus::BlockedOnHost { effect, args } = &fiber.status {
@@ -250,21 +252,14 @@ impl Runtime {
                     .get(*effect)
                     .unwrap_or("")
                     .to_string();
-                let mut host_args = Vec::with_capacity(args.len());
-                for arg in args {
-                    // Validated at block time in this process; a restored
-                    // snapshot re-validates here, failing gracefully instead
-                    // of panicking on crafted input.
-                    host_args.push(crate::host::to_host_value(&self.interpreter, *arg)?);
-                }
                 calls.push(PendingCall {
                     id: CallId(fiber.id),
                     effect: name,
-                    args: host_args,
+                    args: args.clone(),
                 });
             }
         }
-        Ok(calls)
+        calls
     }
 
     fn run_scheduler(&mut self, ast: &AstArena) -> Result<RunOutcome> {
@@ -273,7 +268,7 @@ impl Runtime {
         loop {
             if self.current.is_none() {
                 if self.select_next_fiber().is_none() {
-                    let pending = self.pending_calls()?;
+                    let pending = self.pending_calls();
                     if !pending.is_empty() {
                         return Ok(RunOutcome::Pending(pending));
                     }
@@ -431,10 +426,17 @@ impl Runtime {
     /// in-language handler caught it, so it blocks the performing fiber
     /// until a later task's hosted run loop resumes it with a host answer.
     fn handle_host_effect(&mut self, effect: StrId, args: Vec<JSValue>) -> Result<EffectResult> {
-        // Validate now so an unconvertible argument faults the performing
-        // fiber at the perform site, not later when the host reads the call.
-        for arg in &args {
-            crate::host::to_host_value(&self.interpreter, *arg)?;
+        // Convert to HostValue now, not at drain time: this both faults an
+        // unconvertible argument at the perform site, and freezes what the
+        // host will see. A sibling fiber can still run before the ready
+        // queue drains; if the args were left as JSValue and converted
+        // later, a shared arg object mutated by a sibling after this block
+        // would change the host-visible call, and a sibling adding a
+        // function property to it would turn draining itself into a
+        // fallible operation that could wedge the whole run.
+        let mut host_args = Vec::with_capacity(args.len());
+        for arg in args {
+            host_args.push(crate::host::to_host_value(&self.interpreter, arg)?);
         }
 
         let fiber_id = self.current.expect("No current fiber for host effect");
@@ -444,7 +446,10 @@ impl Runtime {
             .iter_mut()
             .find(|f| f.id == fiber_id)
             .expect("Current fiber not found");
-        fiber.status = FiberStatus::BlockedOnHost { effect, args };
+        fiber.status = FiberStatus::BlockedOnHost {
+            effect,
+            args: host_args,
+        };
         Ok(EffectResult::Block)
     }
 
@@ -812,12 +817,23 @@ mod host_effect_tests {
         };
         assert_eq!(calls.len(), 2);
 
-        rt.resume_with(calls[0].id, HostValue::Int(1)).unwrap();
+        // Match by args, not position: fiber scheduling order is not part
+        // of the contract, only which call carries which args.
+        let one = calls
+            .iter()
+            .find(|c| c.args == vec![HostValue::Str("one".into())])
+            .unwrap();
+        let two = calls
+            .iter()
+            .find(|c| c.args == vec![HostValue::Str("two".into())])
+            .unwrap();
+
+        rt.resume_with(one.id, HostValue::Int(1)).unwrap();
         let RunOutcome::Pending(rest) = rt.run_hosted_continue().unwrap() else {
             panic!("expected the unanswered call to still pend");
         };
         assert_eq!(rest.len(), 1);
-        assert_eq!(rest[0].id, calls[1].id);
+        assert_eq!(rest[0].id, two.id);
 
         rt.resume_with(rest[0].id, HostValue::Int(2)).unwrap();
         let RunOutcome::Done(v) = rt.run_hosted_continue().unwrap() else {
@@ -880,5 +896,45 @@ mod host_effect_tests {
             panic!()
         };
         assert_eq!(v, JSValue::Int(5));
+    }
+
+    #[test]
+    fn pending_call_args_are_frozen_at_block_time_not_drain_time() {
+        use crate::host::{HostValue, RunOutcome};
+        let mut rt = Runtime::new();
+        rt.grant("Ask");
+        // `a` forks first, so it lands at the front of the ready queue and
+        // runs (and blocks on Ask, converting `o`) before `b` gets a turn.
+        // `b` then mutates the same shared object. If conversion happened at
+        // drain time instead of block time, the surfaced call would see
+        // `b`'s mutation even though it happened after `a` had already
+        // asked.
+        let outcome = rt
+            .eval_hosted(
+                "let o = {v: 1};\n\
+                 let a = perform Fork!(() => perform Ask!(o));\n\
+                 let b = perform Fork!(() => { o.v = 2; 0 });\n\
+                 0",
+            )
+            .unwrap();
+        let RunOutcome::Pending(calls) = outcome else {
+            panic!("expected Pending, a should be blocked on Ask");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].effect, "Ask");
+        assert_eq!(
+            calls[0].args,
+            vec![HostValue::Object(vec![(
+                "v".to_string(),
+                HostValue::Int(1)
+            )])],
+            "pending call must reflect the object's value at block time, not after b's later mutation"
+        );
+
+        rt.resume_with(calls[0].id, HostValue::Int(99)).unwrap();
+        let RunOutcome::Done(v) = rt.run_hosted_continue().unwrap() else {
+            panic!("expected Done");
+        };
+        assert_eq!(v, JSValue::Int(0));
     }
 }

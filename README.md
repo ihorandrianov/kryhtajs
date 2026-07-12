@@ -97,6 +97,49 @@ kryhta --resume job.snap   # wakes up inside that call, seeing "restored"
 The snapshot contains the whole machine (fibers, heap, continuations, AST),
 so resuming does not need the original source file.
 
+## Host effects
+
+A script can ask the embedding Rust host for something the language itself
+can't provide — a network call, a file read, a human's approval — by
+performing an effect the host has **granted**. No in-language `handle`
+catches it, so the fiber suspends; the host answers it from Rust:
+
+```rust
+use kryhta::{HostValue, Result, RunOutcome, Runtime};
+
+fn main() -> Result<()> {
+    let mut rt = Runtime::new();
+    rt.grant("AskHuman");
+
+    let mut outcome = rt.eval_hosted(
+        "let answer = perform AskHuman!(\"Approve the deploy?\");\n\
+         perform Print!(answer);\n\
+         answer",
+    )?;
+
+    while let RunOutcome::Pending(calls) = outcome {
+        for call in calls {
+            println!("host got effect {}({:?})", call.effect, call.args);
+            rt.resume_with(call.id, HostValue::Str("approved".to_string()))?;
+        }
+        outcome = rt.run_hosted_continue()?;
+    }
+
+    Ok(())
+}
+```
+
+- Performing an ungranted, unhandled effect faults the fiber at the perform
+  site — capability security by construction.
+- Other fibers keep running while one is blocked on a host call; when the
+  ready queue drains, every pending call surfaces together in
+  `RunOutcome::Pending`, answerable in any order or subset.
+- Pending calls survive `runtime.snapshot(path)` / restore: a process can
+  suspend on a tool call, die, and a later process resumes it and sees the
+  same call.
+
+Run `cargo run --example host_effect` to see this loop end to end.
+
 ## License
 
 MIT
