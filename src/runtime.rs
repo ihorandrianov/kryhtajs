@@ -9,7 +9,7 @@ use crate::error::{JSError, Result};
 use crate::gc::GC;
 use crate::object::{Object, ObjectKind};
 use crate::parser::Parser;
-use crate::string_pool::StrId;
+use crate::string_pool::{StrId, StringPool};
 use crate::value::{JSValue, ObjId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,8 +20,24 @@ pub enum FiberStatus {
     Ready,
     Running,
     Blocked { effect: StrId, args: Vec<JSValue> },
+    BlockedOnHost { effect: StrId, args: Vec<JSValue> },
     Completed(JSValue),
     Failed(JSError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BuiltinEffect {
+    Print,
+    Fork,
+    Join,
+    Gc,
+    Snapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EffectKind {
+    Builtin(BuiltinEffect),
+    Host,
 }
 
 #[derive(Debug, Clone)]
@@ -59,12 +75,35 @@ pub struct Runtime {
     /// Session AST — grows across `eval` calls so function bodies from
     /// earlier evals stay resolvable.
     pub(crate) ast: AstArena,
+    /// Which effect names are handleable by the runtime itself (builtins)
+    /// or granted to cross the host boundary. Anything else faults at the
+    /// perform site unless an in-language handler catches it first.
+    pub effects: HashMap<StrId, EffectKind>,
 }
 
 impl Runtime {
+    /// The builtin effect names every runtime understands out of the box.
+    /// Also used by `snapshot::read_runtime` to re-seed a restored runtime's
+    /// registry (full grant persistence is a later task).
+    pub(crate) fn builtin_effects(strings: &mut StringPool) -> HashMap<StrId, EffectKind> {
+        use BuiltinEffect::*;
+        [
+            ("Print", Print),
+            ("Fork", Fork),
+            ("Join", Join),
+            ("Gc", Gc),
+            ("Snapshot", Snapshot),
+        ]
+        .into_iter()
+        .map(|(name, b)| (strings.intern(name), EffectKind::Builtin(b)))
+        .collect()
+    }
+
     pub fn new() -> Self {
+        let mut interpreter = CEKH::new();
+        let effects = Self::builtin_effects(&mut interpreter.strings);
         Self {
-            interpreter: CEKH::new(),
+            interpreter,
             fibers: Vec::new(),
             ready_queue: VecDeque::new(),
             current: None,
@@ -72,7 +111,15 @@ impl Runtime {
             join_waiters: HashMap::new(),
             gc: GC::new(),
             ast: AstArena::new(),
+            effects,
         }
+    }
+
+    /// Grant the script permission to perform `name` as a host effect.
+    /// Ungranted, unhandled effects fail at the perform site.
+    pub fn grant(&mut self, name: &str) {
+        let id = self.interpreter.strings.intern(name);
+        self.effects.insert(id, EffectKind::Host);
     }
 
     /// Reconstruct a runtime from bytes produced by `snapshot::write_runtime`.
@@ -256,19 +303,47 @@ impl Runtime {
         ast: &AstArena,
     ) -> Result<EffectResult> {
         if self.gc.should_collect(&self.interpreter) {
-            self.gc.collect(&mut self.interpreter, &self.fibers);
+            self.gc
+                .collect(&mut self.interpreter, &self.fibers, &self.effects);
         }
 
-        let effect_name = self.interpreter.strings.get(effect).unwrap_or("");
-
-        match effect_name {
-            "Print" => self.handle_print(args),
-            "Fork" => self.handle_fork(args, ast),
-            "Join" => self.handle_join(args),
-            "Gc" => self.handle_gc(),
-            "Snapshot" => self.handle_snapshot(args, ast),
-            _ => Err(JSError::runtime_error("Unknown effect")),
+        match self.effects.get(&effect).copied() {
+            Some(EffectKind::Builtin(b)) => match b {
+                BuiltinEffect::Print => self.handle_print(args),
+                BuiltinEffect::Fork => self.handle_fork(args, ast),
+                BuiltinEffect::Join => self.handle_join(args),
+                BuiltinEffect::Gc => self.handle_gc(),
+                BuiltinEffect::Snapshot => self.handle_snapshot(args, ast),
+            },
+            Some(EffectKind::Host) => self.handle_host_effect(effect, args),
+            None => {
+                let name = self.interpreter.strings.get(effect).unwrap_or("?");
+                Err(JSError::Message(format!(
+                    "effect '{name}' is not handled and not granted"
+                )))
+            }
         }
+    }
+
+    /// Move a granted effect from the language runtime to the host: no
+    /// in-language handler caught it, so it blocks the performing fiber
+    /// until a later task's hosted run loop resumes it with a host answer.
+    fn handle_host_effect(&mut self, effect: StrId, args: Vec<JSValue>) -> Result<EffectResult> {
+        // Validate now so an unconvertible argument faults the performing
+        // fiber at the perform site, not later when the host reads the call.
+        for arg in &args {
+            crate::host::to_host_value(&self.interpreter, *arg)?;
+        }
+
+        let fiber_id = self.current.expect("No current fiber for host effect");
+        self.save_current_fiber_state();
+        let fiber = self
+            .fibers
+            .iter_mut()
+            .find(|f| f.id == fiber_id)
+            .expect("Current fiber not found");
+        fiber.status = FiberStatus::BlockedOnHost { effect, args };
+        Ok(EffectResult::Block)
     }
 
     fn handle_fork(&mut self, args: Vec<JSValue>, _ast: &AstArena) -> Result<EffectResult> {
@@ -366,7 +441,8 @@ impl Runtime {
     }
 
     fn handle_gc(&mut self) -> Result<EffectResult> {
-        self.gc.collect(&mut self.interpreter, &self.fibers);
+        self.gc
+            .collect(&mut self.interpreter, &self.fibers, &self.effects);
         self.interpreter.control = Control::Value(JSValue::Undefined);
         Ok(EffectResult::Resume)
     }
@@ -483,5 +559,52 @@ impl Runtime {
         fiber.control = Control::Value(value);
         fiber.status = FiberStatus::Ready;
         self.ready_queue.push_back(fiber_id);
+    }
+}
+
+#[cfg(test)]
+mod host_effect_tests {
+    use super::*;
+
+    #[test]
+    fn ungranted_effect_faults_with_named_error() {
+        let mut rt = Runtime::new();
+        let err = rt.eval("perform Nope!(1)").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "effect 'Nope' is not handled and not granted"
+        );
+    }
+
+    #[test]
+    fn granted_effect_blocks_the_fiber() {
+        let mut rt = Runtime::new();
+        rt.grant("Ask");
+        // Scheduler drains with the root fiber blocked on the host;
+        // RunOutcome (Task 3) will surface this — for now eval returns Undefined.
+        rt.eval("perform Ask!(\"q\")").unwrap();
+        assert!(
+            rt.fibers
+                .iter()
+                .any(|f| matches!(f.status, FiberStatus::BlockedOnHost { .. }))
+        );
+    }
+
+    #[test]
+    fn in_language_handler_beats_a_grant() {
+        let mut rt = Runtime::new();
+        rt.grant("Ask");
+        let v = rt
+            .eval("handle { perform Ask!(1) } with { Ask!(x, resume) -> resume(x + 1) }")
+            .unwrap();
+        assert_eq!(v, JSValue::Int(2));
+    }
+
+    #[test]
+    fn unconvertible_args_fault_at_perform_site() {
+        let mut rt = Runtime::new();
+        rt.grant("Ask");
+        let err = rt.eval("perform Ask!((x) => x)").unwrap_err();
+        assert!(err.to_string().contains("cannot convert"), "{err}");
     }
 }

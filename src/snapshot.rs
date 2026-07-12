@@ -467,6 +467,11 @@ fn write_fiber_status(w: &mut ByteWriter, s: &FiberStatus) {
             w.u8(4);
             w.str_(&err.to_string());
         }
+        FiberStatus::BlockedOnHost { effect, args } => {
+            w.u8(5);
+            w.u32(effect.0);
+            write_seq_values(w, args);
+        }
     }
 }
 
@@ -481,6 +486,11 @@ fn read_fiber_status(r: &mut ByteReader) -> Result<FiberStatus> {
         }
         3 => FiberStatus::Completed(read_value(r)?),
         4 => FiberStatus::Failed(JSError::Message(r.str_()?)),
+        5 => {
+            let effect = StrId(r.u32()?);
+            let args = read_seq_values(r)?;
+            FiberStatus::BlockedOnHost { effect, args }
+        }
         tag => {
             return Err(JSError::Message(format!(
                 "snapshot: bad fiber status tag {tag}"
@@ -1979,7 +1989,11 @@ pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
         )));
     }
 
-    let strings = read_strings(&mut r)?;
+    let mut strings = read_strings(&mut r)?;
+    // Temporary until Task 5 persists the actual grant set: re-seed the
+    // restored runtime with just the builtins so `snapshot.rs` keeps
+    // compiling against the registry-based dispatch.
+    let effects = Runtime::builtin_effects(&mut strings);
     let ast = read_ast(&mut r)?;
 
     let objects = read_arena(&mut r, read_object)?;
@@ -2057,6 +2071,7 @@ pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
         join_waiters,
         gc,
         ast,
+        effects,
     })
 }
 

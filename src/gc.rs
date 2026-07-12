@@ -2,9 +2,10 @@ use crate::cekh::{CEKH, Control};
 use crate::cont::ContId;
 use crate::env::EnvId;
 use crate::handler::HandlerId;
-use crate::runtime::{Fiber, FiberStatus};
+use crate::runtime::{EffectKind, Fiber, FiberStatus};
 use crate::string_pool::StrId;
 use crate::value::{JSValue, ObjId};
+use std::collections::HashMap;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GCStats {
@@ -49,15 +50,31 @@ impl GC {
         self.alloc_snapshot = interpreter.total_allocations();
     }
 
-    pub fn collect(&mut self, interpreter: &mut CEKH, fibers: &[Fiber]) {
-        self.mark(interpreter, fibers);
+    pub fn collect(
+        &mut self,
+        interpreter: &mut CEKH,
+        fibers: &[Fiber],
+        effects: &HashMap<StrId, EffectKind>,
+    ) {
+        self.mark(interpreter, fibers, effects);
         self.sweep(interpreter);
         self.alloc_snapshot = interpreter.total_allocations();
         self.stats.collections += 1;
     }
 
-    fn mark(&mut self, interpreter: &mut CEKH, fibers: &[Fiber]) {
+    fn mark(
+        &mut self,
+        interpreter: &mut CEKH,
+        fibers: &[Fiber],
+        effects: &HashMap<StrId, EffectKind>,
+    ) {
         self.work_list.clear();
+
+        // Grant names must survive collection even when no fiber currently
+        // references them (e.g. a grant with no pending perform).
+        for key in effects.keys() {
+            self.work_list.push(WorkItem::Value(JSValue::String(*key)));
+        }
         let control = interpreter.control.clone();
         let env = interpreter.env;
         let cont = interpreter.cont;
@@ -105,6 +122,16 @@ impl GC {
                     self.work_list.push(WorkItem::Value(*value));
                 }
                 FiberStatus::Blocked { args, .. } => {
+                    for arg in args {
+                        self.work_list.push(WorkItem::Value(*arg));
+                    }
+                }
+                FiberStatus::BlockedOnHost { effect, args } => {
+                    // The effect name and args live only in the status while
+                    // the fiber waits for the host; without these roots a GC
+                    // could sweep them before the host reads the call.
+                    self.work_list
+                        .push(WorkItem::Value(JSValue::String(*effect)));
                     for arg in args {
                         self.work_list.push(WorkItem::Value(*arg));
                     }
