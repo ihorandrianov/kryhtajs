@@ -33,7 +33,7 @@ pub use cont::{ContArena, ContId, Kont};
 pub use env::{Env, EnvArena, EnvId};
 pub use error::{JSError, Result};
 pub use handler::{Handler, HandlerArena, HandlerId};
-pub use host::HostValue;
+pub use host::{CallId, HostValue, PendingCall, RunOutcome};
 pub use runtime::{BuiltinEffect, EffectKind, Runtime};
 pub use string_pool::{StrId, StringPool};
 pub use value::{JSValue, ObjId};

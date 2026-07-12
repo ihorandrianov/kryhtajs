@@ -4,8 +4,28 @@
 use crate::cekh::CEKH;
 use crate::error::{JSError, Result};
 use crate::object::{Object, ObjectKind};
+use crate::runtime::FiberId;
 use crate::value::{JSValue, ObjId};
 use std::collections::HashSet;
+
+/// Identifies one pending host call. It is the blocked fiber's id —
+/// fiber ids are monotonic and never reused, and a fiber has at most
+/// one pending effect, so no separate counter exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallId(pub(crate) FiberId);
+
+#[derive(Debug, Clone)]
+pub struct PendingCall {
+    pub id: CallId,
+    pub effect: String,
+    pub args: Vec<HostValue>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RunOutcome {
+    Done(JSValue),
+    Pending(Vec<PendingCall>),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostValue {

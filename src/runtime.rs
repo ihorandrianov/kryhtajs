@@ -7,6 +7,7 @@ use crate::cont::ContId;
 use crate::env::EnvId;
 use crate::error::{JSError, Result};
 use crate::gc::GC;
+use crate::host::{CallId, HostValue, PendingCall, RunOutcome};
 use crate::object::{Object, ObjectKind};
 use crate::parser::Parser;
 use crate::string_pool::{StrId, StringPool};
@@ -143,7 +144,20 @@ impl Runtime {
         result
     }
 
+    /// Run to completion, requiring the whole program to stay inside the
+    /// language: a host call surfacing is an error rather than a value.
+    /// Use `run_hosted` for programs that perform granted host effects.
     pub fn run(&mut self, ast: &AstArena) -> Result<JSValue> {
+        match self.run_hosted(ast)? {
+            RunOutcome::Done(v) => Ok(v),
+            RunOutcome::Pending(calls) => Err(JSError::Message(format!(
+                "effect '{}' suspended to the host; use run_hosted/eval_hosted",
+                calls[0].effect
+            ))),
+        }
+    }
+
+    pub fn run_hosted(&mut self, ast: &AstArena) -> Result<RunOutcome> {
         self.interpreter.fresh_exec_setup(ast)?;
 
         // Each run is a fresh top-level execution: fibers from a previous
@@ -171,19 +185,105 @@ impl Runtime {
     /// Continue a runtime restored from a snapshot: enter the scheduler
     /// without the per-run reset.
     pub fn run_resumed(&mut self) -> Result<JSValue> {
+        match self.run_hosted_continue()? {
+            RunOutcome::Done(v) => Ok(v),
+            RunOutcome::Pending(calls) => Err(JSError::Message(format!(
+                "effect '{}' suspended to the host; use run_hosted/eval_hosted",
+                calls[0].effect
+            ))),
+        }
+    }
+
+    /// Re-enter the scheduler after `resume_with` — no per-run reset,
+    /// mirroring `run_resumed`.
+    pub fn run_hosted_continue(&mut self) -> Result<RunOutcome> {
         let ast = std::mem::take(&mut self.ast);
         let result = self.run_scheduler(&ast);
         self.ast = ast;
         result
     }
 
-    fn run_scheduler(&mut self, ast: &AstArena) -> Result<JSValue> {
+    pub fn eval_hosted(&mut self, source: &str) -> Result<RunOutcome> {
+        let parser =
+            Parser::with_state(source, self.interpreter.strings.clone(), self.ast.clone())?;
+        let (arena, strings) = parser.parse_program()?;
+        self.interpreter.strings = strings;
+        self.ast = arena;
+
+        let ast = std::mem::take(&mut self.ast);
+        let result = self.run_hosted(&ast);
+        self.ast = ast;
+        result
+    }
+
+    /// Deliver a host answer to a suspended `perform` and mark its fiber
+    /// ready. Derived fresh from fiber state each call rather than stored,
+    /// since fiber state is already the single source of truth for what's
+    /// pending (see `pending_calls`).
+    pub fn resume_with(&mut self, id: CallId, value: HostValue) -> Result<()> {
+        let fiber_id = id.0;
+        let is_pending = self
+            .fibers
+            .iter()
+            .any(|f| f.id == fiber_id && matches!(f.status, FiberStatus::BlockedOnHost { .. }));
+        if !is_pending {
+            return Err(JSError::Message(format!(
+                "resume_with: no pending host call for fiber {}",
+                fiber_id.0
+            )));
+        }
+        let v = crate::host::from_host_value(&mut self.interpreter, &value);
+        self.unblock_fiber(fiber_id, v);
+        Ok(())
+    }
+
+    /// Pending-call derivation (single source of truth — never stored).
+    fn pending_calls(&self) -> Result<Vec<PendingCall>> {
+        let mut calls = Vec::new();
+        for fiber in &self.fibers {
+            if let FiberStatus::BlockedOnHost { effect, args } = &fiber.status {
+                let name = self
+                    .interpreter
+                    .strings
+                    .get(*effect)
+                    .unwrap_or("")
+                    .to_string();
+                let mut host_args = Vec::with_capacity(args.len());
+                for arg in args {
+                    // Validated at block time in this process; a restored
+                    // snapshot re-validates here, failing gracefully instead
+                    // of panicking on crafted input.
+                    host_args.push(crate::host::to_host_value(&self.interpreter, *arg)?);
+                }
+                calls.push(PendingCall {
+                    id: CallId(fiber.id),
+                    effect: name,
+                    args: host_args,
+                });
+            }
+        }
+        Ok(calls)
+    }
+
+    fn run_scheduler(&mut self, ast: &AstArena) -> Result<RunOutcome> {
         let mut main_result = JSValue::Undefined;
 
         loop {
             if self.current.is_none() {
                 if self.select_next_fiber().is_none() {
-                    return Ok(main_result);
+                    let pending = self.pending_calls()?;
+                    if !pending.is_empty() {
+                        return Ok(RunOutcome::Pending(pending));
+                    }
+                    // Prefer the root fiber's recorded result: on a continued
+                    // or resumed run, the root may have completed in an
+                    // earlier scheduler entry, where the local `main_result`
+                    // never saw it.
+                    let root = self.fibers.iter().find_map(|f| match (&f.id, &f.status) {
+                        (FiberId(0), FiberStatus::Completed(v)) => Some(*v),
+                        _ => None,
+                    });
+                    return Ok(RunOutcome::Done(root.unwrap_or(main_result)));
                 }
             }
 
@@ -578,16 +678,68 @@ mod host_effect_tests {
 
     #[test]
     fn granted_effect_blocks_the_fiber() {
+        use crate::host::RunOutcome;
         let mut rt = Runtime::new();
         rt.grant("Ask");
-        // Scheduler drains with the root fiber blocked on the host;
-        // RunOutcome (Task 3) will surface this — for now eval returns Undefined.
-        rt.eval("perform Ask!(\"q\")").unwrap();
+        // eval_hosted surfaces the block as RunOutcome::Pending rather than
+        // leaving the caller to inspect fiber internals.
+        let outcome = rt.eval_hosted("perform Ask!(\"q\")").unwrap();
+        let RunOutcome::Pending(calls) = outcome else {
+            panic!("expected Pending");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].effect, "Ask");
         assert!(
             rt.fibers
                 .iter()
                 .any(|f| matches!(f.status, FiberStatus::BlockedOnHost { .. }))
         );
+    }
+
+    #[test]
+    fn host_effect_suspends_and_resumes_end_to_end() {
+        use crate::host::{HostValue, RunOutcome};
+        let mut rt = Runtime::new();
+        rt.grant("Ask");
+        let outcome = rt.eval_hosted("perform Ask!(\"q\", 42)").unwrap();
+        let RunOutcome::Pending(calls) = outcome else {
+            panic!("expected Pending");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].effect, "Ask");
+        assert_eq!(
+            calls[0].args,
+            vec![HostValue::Str("q".to_string()), HostValue::Int(42)]
+        );
+
+        rt.resume_with(calls[0].id, HostValue::Str("answer".to_string()))
+            .unwrap();
+        let RunOutcome::Done(v) = rt.run_hosted_continue().unwrap() else {
+            panic!("expected Done");
+        };
+        let JSValue::String(id) = v else {
+            panic!("expected string result, got {v:?}");
+        };
+        assert_eq!(rt.interpreter.strings.get(id), Some("answer"));
+    }
+
+    #[test]
+    fn plain_eval_errors_when_a_host_call_surfaces() {
+        let mut rt = Runtime::new();
+        rt.grant("Ask");
+        let err = rt.eval("perform Ask!(1)").unwrap_err();
+        assert!(err.to_string().contains("Ask"), "{err}");
+        assert!(err.to_string().contains("run_hosted"), "{err}");
+    }
+
+    #[test]
+    fn resume_with_unknown_call_id_is_an_error() {
+        use crate::host::{CallId, HostValue};
+        let mut rt = Runtime::new();
+        let err = rt
+            .resume_with(CallId(FiberId(99)), HostValue::Int(1))
+            .unwrap_err();
+        assert!(err.to_string().contains("no pending host call"), "{err}");
     }
 
     #[test]
