@@ -128,6 +128,14 @@ impl Runtime {
         crate::snapshot::read_runtime(bytes)
     }
 
+    /// Host-triggered checkpoint. Callable between runs — typically after
+    /// `run_hosted` returned `Pending` — when `self.ast` holds the session AST.
+    pub fn snapshot(&mut self, path: &str) -> Result<()> {
+        let ready = self.ready_queue.clone();
+        let bytes = crate::snapshot::write_runtime(self, &ready);
+        crate::snapshot::write_snapshot_file(path, &bytes)
+    }
+
     /// Parse and run source against this runtime's persistent session state.
     /// Parses against clones and commits only on success, so a syntax error
     /// leaves the session (string pool, AST, globals) intact.
@@ -183,15 +191,9 @@ impl Runtime {
     }
 
     /// Continue a runtime restored from a snapshot: enter the scheduler
-    /// without the per-run reset.
-    pub fn run_resumed(&mut self) -> Result<JSValue> {
-        match self.run_hosted_continue()? {
-            RunOutcome::Done(v) => Ok(v),
-            RunOutcome::Pending(calls) => Err(JSError::Message(format!(
-                "effect '{}' suspended to the host; use run_hosted/eval_hosted",
-                calls[0].effect
-            ))),
-        }
+    /// without the per-run reset, re-surfacing any still-pending host calls.
+    pub fn run_resumed(&mut self) -> Result<RunOutcome> {
+        self.run_hosted_continue()
     }
 
     /// Re-enter the scheduler after `resume_with` — no per-run reset,
@@ -578,19 +580,8 @@ impl Runtime {
         // caller may have left in `self.ast`.
         let prev_ast = std::mem::replace(&mut self.ast, ast.clone());
         let bytes = crate::snapshot::write_runtime(self, &ready);
-
-        // Write to a temp file and rename so a process kill mid-write can't
-        // truncate/corrupt the last good checkpoint on disk.
-        let tmp_path = format!("{path}.tmp");
-        let write_result = std::fs::write(&tmp_path, &bytes)
-            .map_err(|e| JSError::Message(format!("Snapshot: cannot write {tmp_path}: {e}")))
-            .and_then(|_| {
-                std::fs::rename(&tmp_path, &path).map_err(|e| {
-                    JSError::Message(format!("Snapshot: cannot rename {tmp_path}: {e}"))
-                })
-            });
         self.ast = prev_ast;
-        write_result?;
+        crate::snapshot::write_snapshot_file(&path, &bytes)?;
 
         // The live run continues, seeing "saved".
         self.interpreter.control = Control::Value(JSValue::String(saved));
@@ -858,5 +849,36 @@ mod host_effect_tests {
             panic!("expected Done");
         };
         assert_eq!(v, JSValue::Int(7));
+    }
+
+    #[test]
+    fn pending_host_call_survives_snapshot_round_trip() {
+        use crate::host::{HostValue, RunOutcome};
+        let mut rt = Runtime::new();
+        rt.grant("Ask");
+        let RunOutcome::Pending(calls) = rt.eval_hosted("perform Ask!(\"q\")").unwrap() else {
+            panic!()
+        };
+
+        let ready = rt.ready_queue.clone();
+        let bytes = {
+            // In-memory round trip: same codec `Runtime::snapshot` writes to disk.
+            crate::snapshot::write_runtime(&rt, &ready)
+        };
+        let mut rt2 = Runtime::from_snapshot(&bytes).unwrap();
+
+        let RunOutcome::Pending(calls2) = rt2.run_resumed().unwrap() else {
+            panic!("restored runtime must re-surface the pending call");
+        };
+        assert_eq!(calls2.len(), 1);
+        assert_eq!(calls2[0].effect, "Ask");
+        assert_eq!(calls2[0].args, calls[0].args);
+        assert_eq!(calls2[0].id, calls[0].id);
+
+        rt2.resume_with(calls2[0].id, HostValue::Int(5)).unwrap();
+        let RunOutcome::Done(v) = rt2.run_hosted_continue().unwrap() else {
+            panic!()
+        };
+        assert_eq!(v, JSValue::Int(5));
     }
 }

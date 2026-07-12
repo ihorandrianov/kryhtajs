@@ -1,6 +1,6 @@
 //! Integration tests for KryhtaJS
 
-use kryhta::{JSValue, Result, Runtime};
+use kryhta::{JSValue, Result, RunOutcome, Runtime};
 
 fn eval(runtime: &mut Runtime, source: &str) -> Result<JSValue> {
     runtime.eval(source)
@@ -265,7 +265,9 @@ fn test_snapshot_saved_and_restored() {
 
     let bytes = std::fs::read(&path).unwrap();
     let mut restored = Runtime::from_snapshot(&bytes).unwrap();
-    let second = restored.run_resumed().unwrap();
+    let RunOutcome::Done(second) = restored.run_resumed().unwrap() else {
+        panic!("this program never pends on a host effect");
+    };
     assert_eq!(restored.interpreter.to_string(second), "restored");
     // the increment after the snapshot ran again in the restored world
     assert_eq!(
@@ -295,7 +297,9 @@ fn test_snapshot_round_trip_equivalence() {
 
     let bytes = std::fs::read(&path).unwrap();
     let mut restored = Runtime::from_snapshot(&bytes).unwrap();
-    let resumed = restored.run_resumed().unwrap();
+    let RunOutcome::Done(resumed) = restored.run_resumed().unwrap() else {
+        panic!("this program never pends on a host effect");
+    };
     assert_eq!(
         resumed,
         JSValue::Int(52),

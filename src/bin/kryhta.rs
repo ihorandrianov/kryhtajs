@@ -43,11 +43,18 @@ fn resume(path: &str) -> Result<()> {
     };
 
     match runtime.run_resumed() {
-        Ok(result) => {
+        Ok(kryhta::RunOutcome::Done(result)) => {
             if !matches!(result, JSValue::Undefined) {
                 print_value(&result, &runtime);
             }
             Ok(())
+        }
+        Ok(kryhta::RunOutcome::Pending(calls)) => {
+            eprintln!(
+                "Error: snapshot is waiting on host effect '{}'; the CLI has no host tools — resume it from a Rust embedder",
+                calls[0].effect
+            );
+            std::process::exit(1);
         }
         Err(e) => {
             eprintln!("Error: {}", e);

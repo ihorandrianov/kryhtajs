@@ -18,7 +18,7 @@ use crate::handler::{Handler, HandlerArena};
 use crate::object::{
     ArrayData, BoundFunctionData, FunctionData, NativeFn, Object, ObjectKind, Property,
 };
-use crate::runtime::{Fiber, FiberId, FiberStatus, Runtime};
+use crate::runtime::{BuiltinEffect, EffectKind, Fiber, FiberId, FiberStatus, Runtime};
 use crate::string_pool::{StrId, StringPool};
 use crate::value::{JSValue, ObjId};
 use crate::{ContId, HandlerId};
@@ -1868,7 +1868,7 @@ fn read_ast(r: &mut ByteReader) -> Result<AstArena> {
 }
 
 pub const MAGIC: &[u8; 4] = b"KRHT";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 fn write_arena<T>(w: &mut ByteWriter, arena: &Arena<T>, write_elem: fn(&mut ByteWriter, &T)) {
     let slots = arena.slots();
@@ -1970,6 +1970,19 @@ pub fn write_runtime(rt: &Runtime, ready_override: &VecDeque<FiberId>) -> Vec<u8
         }
     }
 
+    w.u32(rt.effects.len() as u32);
+    for (name, kind) in &rt.effects {
+        w.u32(name.0);
+        w.u8(match kind {
+            EffectKind::Builtin(BuiltinEffect::Print) => 0,
+            EffectKind::Builtin(BuiltinEffect::Fork) => 1,
+            EffectKind::Builtin(BuiltinEffect::Join) => 2,
+            EffectKind::Builtin(BuiltinEffect::Gc) => 3,
+            EffectKind::Builtin(BuiltinEffect::Snapshot) => 4,
+            EffectKind::Host => 5,
+        });
+    }
+
     w.finish()
 }
 
@@ -1989,11 +2002,7 @@ pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
         )));
     }
 
-    let mut strings = read_strings(&mut r)?;
-    // Temporary until Task 5 persists the actual grant set: re-seed the
-    // restored runtime with just the builtins so `snapshot.rs` keeps
-    // compiling against the registry-based dispatch.
-    let effects = Runtime::builtin_effects(&mut strings);
+    let strings = read_strings(&mut r)?;
     let ast = read_ast(&mut r)?;
 
     let objects = read_arena(&mut r, read_object)?;
@@ -2047,6 +2056,26 @@ pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
         join_waiters.insert(fiber_id, waiters);
     }
 
+    let n = r.u32()? as usize;
+    let mut effects = HashMap::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        let name = StrId(r.u32()?);
+        let kind = match r.u8()? {
+            0 => EffectKind::Builtin(BuiltinEffect::Print),
+            1 => EffectKind::Builtin(BuiltinEffect::Fork),
+            2 => EffectKind::Builtin(BuiltinEffect::Join),
+            3 => EffectKind::Builtin(BuiltinEffect::Gc),
+            4 => EffectKind::Builtin(BuiltinEffect::Snapshot),
+            5 => EffectKind::Host,
+            tag => {
+                return Err(JSError::Message(format!(
+                    "snapshot: bad effect kind tag {tag}"
+                )));
+            }
+        };
+        effects.insert(name, kind);
+    }
+
     let interpreter = CEKH {
         control,
         env,
@@ -2073,6 +2102,16 @@ pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
         ast,
         effects,
     })
+}
+
+/// Write to a temp file and rename so a process kill mid-write can't
+/// truncate/corrupt the last good checkpoint on disk.
+pub(crate) fn write_snapshot_file(path: &str, bytes: &[u8]) -> Result<()> {
+    let tmp_path = format!("{path}.tmp");
+    std::fs::write(&tmp_path, bytes)
+        .map_err(|e| JSError::Message(format!("Snapshot: cannot write {tmp_path}: {e}")))?;
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| JSError::Message(format!("Snapshot: cannot rename {tmp_path}: {e}")))
 }
 
 #[cfg(test)]
@@ -2981,5 +3020,40 @@ mod tests {
         assert!(Runtime::from_snapshot(&bytes).is_err());
         bytes.truncate(bytes.len() / 2);
         assert!(Runtime::from_snapshot(&bytes).is_err());
+    }
+
+    #[test]
+    fn effect_registry_round_trips_including_grants() {
+        use crate::runtime::{EffectKind, Runtime};
+        let mut rt = Runtime::new();
+        rt.grant("FetchUrl");
+        let bytes = write_runtime(&rt, &rt.ready_queue.clone());
+        let mut rt2 = read_runtime(&bytes).unwrap();
+        // StringPool has no `lookup(&str)`; `intern` returns the existing id
+        // for an already-interned string, so it doubles as a lookup here.
+        let fetch = rt2.interpreter.strings.intern("FetchUrl");
+        assert_eq!(rt2.effects.get(&fetch), Some(&EffectKind::Host));
+        assert_eq!(rt2.effects.len(), rt.effects.len());
+    }
+
+    #[test]
+    fn blocked_on_host_status_round_trips() {
+        use crate::runtime::FiberStatus;
+        let mut w = ByteWriter::new();
+        write_fiber_status(
+            &mut w,
+            &FiberStatus::BlockedOnHost {
+                effect: StrId(7),
+                args: vec![JSValue::Int(1), JSValue::Bool(true)],
+            },
+        );
+        let bytes = w.finish();
+        let mut r = ByteReader::new(&bytes);
+        let FiberStatus::BlockedOnHost { effect, args } = read_fiber_status(&mut r).unwrap()
+        else {
+            panic!("wrong status variant");
+        };
+        assert_eq!(effect, StrId(7));
+        assert_eq!(args, vec![JSValue::Int(1), JSValue::Bool(true)]);
     }
 }
