@@ -759,4 +759,104 @@ mod host_effect_tests {
         let err = rt.eval("perform Ask!((x) => x)").unwrap_err();
         assert!(err.to_string().contains("cannot convert"), "{err}");
     }
+
+    #[test]
+    fn two_fibers_pend_concurrently_and_answer_out_of_order() {
+        use crate::host::{HostValue, RunOutcome};
+        let mut rt = Runtime::new();
+        rt.grant("Ask");
+        let outcome = rt
+            .eval_hosted(
+                "let a = perform Fork!(() => perform Ask!(\"first\"));\n\
+                 let b = perform Fork!(() => perform Ask!(\"second\"));\n\
+                 let ra = perform Join!(a);\n\
+                 let rb = perform Join!(b);\n\
+                 [ra.ok, rb.ok]",
+            )
+            .unwrap();
+        let RunOutcome::Pending(calls) = outcome else {
+            panic!("expected Pending, root should be blocked on Join");
+        };
+        assert_eq!(calls.len(), 2);
+
+        let first = calls
+            .iter()
+            .find(|c| c.args == vec![HostValue::Str("first".into())])
+            .unwrap();
+        let second = calls
+            .iter()
+            .find(|c| c.args == vec![HostValue::Str("second".into())])
+            .unwrap();
+
+        // Answer in reverse arrival order.
+        rt.resume_with(second.id, HostValue::Int(2)).unwrap();
+        rt.resume_with(first.id, HostValue::Int(1)).unwrap();
+
+        let RunOutcome::Done(v) = rt.run_hosted_continue().unwrap() else {
+            panic!("expected Done");
+        };
+        let hv = crate::host::to_host_value(&rt.interpreter, v).unwrap();
+        assert_eq!(
+            hv,
+            HostValue::Array(vec![HostValue::Int(1), HostValue::Int(2)])
+        );
+    }
+
+    #[test]
+    fn answering_a_subset_returns_the_remainder() {
+        use crate::host::{HostValue, RunOutcome};
+        let mut rt = Runtime::new();
+        rt.grant("Ask");
+        let outcome = rt
+            .eval_hosted(
+                "let a = perform Fork!(() => perform Ask!(\"one\"));\n\
+                 let b = perform Fork!(() => perform Ask!(\"two\"));\n\
+                 let ra = perform Join!(a);\n\
+                 let rb = perform Join!(b);\n\
+                 0",
+            )
+            .unwrap();
+        let RunOutcome::Pending(calls) = outcome else {
+            panic!("expected Pending")
+        };
+        assert_eq!(calls.len(), 2);
+
+        rt.resume_with(calls[0].id, HostValue::Int(1)).unwrap();
+        let RunOutcome::Pending(rest) = rt.run_hosted_continue().unwrap() else {
+            panic!("expected the unanswered call to still pend");
+        };
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, calls[1].id);
+
+        rt.resume_with(rest[0].id, HostValue::Int(2)).unwrap();
+        let RunOutcome::Done(v) = rt.run_hosted_continue().unwrap() else {
+            panic!("expected Done")
+        };
+        assert_eq!(v, JSValue::Int(0));
+    }
+
+    #[test]
+    fn root_result_survives_while_child_pends() {
+        use crate::host::{HostValue, RunOutcome};
+        let mut rt = Runtime::new();
+        rt.grant("Ask");
+        // The root fiber forks a child that blocks on a host effect, then
+        // completes on its own. run_hosted_continue must report the root's
+        // recorded result once the child is answered, not Undefined.
+        let outcome = rt
+            .eval_hosted("let a = perform Fork!(() => perform Ask!(\"bg\")); 7")
+            .unwrap();
+        let RunOutcome::Pending(calls) = outcome else {
+            panic!("expected Pending, child should be blocked on Ask");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].effect, "Ask");
+        assert_eq!(calls[0].args, vec![HostValue::Str("bg".into())]);
+
+        rt.resume_with(calls[0].id, HostValue::Int(99)).unwrap();
+        let RunOutcome::Done(v) = rt.run_hosted_continue().unwrap() else {
+            panic!("expected Done");
+        };
+        assert_eq!(v, JSValue::Int(7));
+    }
 }
