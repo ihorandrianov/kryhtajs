@@ -306,3 +306,50 @@ fn test_snapshot_round_trip_equivalence() {
         "restored run must produce the identical result"
     );
 }
+
+#[test]
+fn test_host_effect_survives_process_boundary() {
+    use kryhta::{HostValue, RunOutcome, Runtime};
+
+    let path = std::env::temp_dir()
+        .join(format!("kryhta_host_{}.snap", std::process::id()))
+        .to_string_lossy()
+        .to_string();
+
+    // "Process 1": suspend on a tool call, checkpoint, die.
+    let mut rt = Runtime::new();
+    rt.grant("FetchUrl");
+    let outcome = rt
+        .eval_hosted("perform FetchUrl!(\"https://example.com\")")
+        .unwrap();
+    let RunOutcome::Pending(calls) = outcome else {
+        panic!("expected the fiber to suspend to the host");
+    };
+    assert_eq!(calls[0].effect, "FetchUrl");
+    rt.snapshot(&path).unwrap();
+    drop(rt);
+
+    // "Process 2": restore, see the same call, answer it.
+    let bytes = std::fs::read(&path).unwrap();
+    let mut rt2 = Runtime::from_snapshot(&bytes).unwrap();
+    let RunOutcome::Pending(calls2) = rt2.run_resumed().unwrap() else {
+        panic!("restored runtime must re-surface the pending call");
+    };
+    assert_eq!(calls2[0].effect, "FetchUrl");
+    assert_eq!(
+        calls2[0].args,
+        vec![HostValue::Str("https://example.com".to_string())]
+    );
+
+    rt2.resume_with(calls2[0].id, HostValue::Str("<html>ok</html>".to_string()))
+        .unwrap();
+    let RunOutcome::Done(v) = rt2.run_hosted_continue().unwrap() else {
+        panic!("expected completion after the answer");
+    };
+    let kryhta::JSValue::String(id) = v else {
+        panic!("expected string result");
+    };
+    assert_eq!(rt2.interpreter.strings.get(id), Some("<html>ok</html>"));
+
+    std::fs::remove_file(&path).ok();
+}
