@@ -893,6 +893,65 @@ mod tests {
     }
 
     #[test]
+    fn tampered_answer_diverges_when_it_propagates() {
+        // `answer` is an input to re-execution, not itself a verified field,
+        // so tampering it alone must not be caught at its own event — only
+        // once it flows into a later verified arg (here, the pass-back).
+        let path = temp_path("tamper_answer.klog");
+        let script = "let x = perform Ask!(\"gimme\");\n\
+                      let y = perform Ask!(x);\n\
+                      y";
+        let mut rt = Runtime::new();
+        rt.grant("Ask").unwrap();
+        rt.record_to(&path).unwrap();
+        let RunOutcome::Pending(calls) = rt.eval_hosted(script).unwrap() else {
+            panic!()
+        };
+        rt.resume_with(calls[0].id, HV::Int(7)).unwrap();
+        let RunOutcome::Pending(calls2) = rt.run_hosted_continue().unwrap() else {
+            panic!()
+        };
+        rt.resume_with(calls2[0].id, HV::Int(1)).unwrap();
+        rt.run_hosted_continue().unwrap();
+        drop(rt);
+
+        // rewrite the log with event 0's answer forged: 7 -> 999
+        let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
+        let mut bytes = encode_header(&parsed.header);
+        for (i, event) in parsed.events.iter().enumerate() {
+            if i == 0 {
+                let LogEvent::HostAnswer {
+                    call_id,
+                    effect,
+                    args,
+                    answer: _,
+                } = event
+                else {
+                    panic!("expected event 0 to be a HostAnswer");
+                };
+                bytes.extend_from_slice(&encode_event(&LogEvent::HostAnswer {
+                    call_id: *call_id,
+                    effect: effect.clone(),
+                    args: args.clone(),
+                    answer: HV::Int(999),
+                }));
+            } else {
+                bytes.extend_from_slice(&encode_event(event));
+            }
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        // the second HostAnswer's recorded args say [Int(7)], but the
+        // re-executed run (fed the forged 999) performs Ask!(999)
+        let Err(err) = Runtime::resume_from_log(&path) else {
+            panic!("expected error");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("diverged at event"), "{msg}");
+        assert!(msg.contains("args"), "{msg}");
+    }
+
+    #[test]
     fn torn_tail_recovers_and_reseals_the_log() {
         let path = temp_path("torn.klog");
         let mut rt = Runtime::new();

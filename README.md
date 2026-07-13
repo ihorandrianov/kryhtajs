@@ -163,7 +163,10 @@ recorded one. A mismatch is a divergence error, never silent corruption.
 Since the source is embedded, divergence can only mean nondeterminism or a
 tampered log. Replay is read-only reconstruction: `Snapshot!` effects
 don't re-write files (`Print!` re-runs, by design — the output is part of
-the audit trail).
+the audit trail). Recorded answers are inputs to re-execution rather than
+checks, so a tampered answer is caught transitively — when it propagates
+into a later verified argument or the recorded final result — not at its
+own event.
 
 CLI: `kryhta --record run.klog script.js`, then `kryhta --replay run.klog`.
 

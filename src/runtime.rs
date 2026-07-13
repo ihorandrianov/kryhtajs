@@ -317,19 +317,28 @@ impl Runtime {
             ));
         }
         let fiber_id = id.0;
-        let pending = self.fibers.iter().find_map(|f| match (&f.id, &f.status) {
-            (fid, FiberStatus::BlockedOnHost { effect, args }) if *fid == fiber_id => {
-                Some((*effect, args.clone()))
-            }
-            _ => None,
+        let is_pending = self.fibers.iter().any(|f| {
+            f.id == fiber_id && matches!(f.status, FiberStatus::BlockedOnHost { .. })
         });
-        let Some((effect, args)) = pending else {
+        if !is_pending {
             return Err(JSError::Message(format!(
                 "resume_with: no pending host call for fiber {}",
                 fiber_id.0
             )));
-        };
+        }
         if matches!(self.log, LogMode::Recording(_)) {
+            // Only the recording path needs effect/args off the fiber — the
+            // clone would be wasted work on every plain (non-logged) call.
+            let (effect, args) = self
+                .fibers
+                .iter()
+                .find_map(|f| match (&f.id, &f.status) {
+                    (fid, FiberStatus::BlockedOnHost { effect, args }) if *fid == fiber_id => {
+                        Some((*effect, args.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("checked pending above");
             let effect_name = self
                 .interpreter
                 .strings
