@@ -481,4 +481,91 @@ mod tests {
         let err = rt.eval("1 + 1").unwrap_err();
         assert!(err.to_string().contains("eval_hosted"), "{err}");
     }
+
+    use crate::host::{HostValue as HV, RunOutcome};
+
+    #[test]
+    fn recording_captures_answers_continues_and_done_in_order() {
+        let path = temp_path("session.klog");
+        let mut rt = Runtime::new();
+        rt.grant("Ask").unwrap();
+        rt.record_to(&path).unwrap();
+        let RunOutcome::Pending(calls) = rt
+            .eval_hosted(
+                "let a = perform Fork!(() => perform Ask!(\"first\"));\n\
+                 let b = perform Fork!(() => perform Ask!(\"second\"));\n\
+                 let ra = perform Join!(a);\n\
+                 let rb = perform Join!(b);\n\
+                 [ra.ok, rb.ok]",
+            )
+            .unwrap()
+        else {
+            panic!("expected Pending");
+        };
+        assert_eq!(calls.len(), 2);
+        let first = calls
+            .iter()
+            .find(|c| c.args == vec![HV::Str("first".into())])
+            .unwrap();
+        let second = calls
+            .iter()
+            .find(|c| c.args == vec![HV::Str("second".into())])
+            .unwrap();
+
+        // answer out of order, in two batches with a continue between
+        rt.resume_with(second.id, HV::Int(2)).unwrap();
+        let RunOutcome::Pending(_) = rt.run_hosted_continue().unwrap() else {
+            panic!("first still pending");
+        };
+        rt.resume_with(first.id, HV::Int(1)).unwrap();
+        let RunOutcome::Done(_) = rt.run_hosted_continue().unwrap() else {
+            panic!("expected Done");
+        };
+
+        let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
+        let kinds: Vec<u8> = parsed
+            .events
+            .iter()
+            .map(|e| match e {
+                LogEvent::HostAnswer { .. } => 1,
+                LogEvent::Continue => 2,
+                LogEvent::Done { .. } => 3,
+            })
+            .collect();
+        assert_eq!(kinds, vec![1, 2, 1, 2, 3]);
+        let LogEvent::HostAnswer { effect, args, answer, .. } = &parsed.events[0] else {
+            panic!();
+        };
+        assert_eq!(effect, "Ask");
+        assert_eq!(args, &vec![HV::Str("second".into())]);
+        assert_eq!(answer, &HV::Int(2));
+        let LogEvent::Done { result } = &parsed.events[4] else {
+            panic!();
+        };
+        assert_eq!(
+            result,
+            &Some(HV::Array(vec![HV::Int(1), HV::Int(2)]))
+        );
+    }
+
+    #[test]
+    fn unconvertible_final_result_records_done_without_a_value() {
+        let path = temp_path("fnresult.klog");
+        let mut rt = Runtime::new();
+        rt.record_to(&path).unwrap();
+        rt.eval_hosted("(x) => x").unwrap();
+        let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(matches!(
+            parsed.events.as_slice(),
+            [LogEvent::Done { result: None }]
+        ));
+    }
+
+    #[test]
+    fn recording_io_failure_surfaces_before_the_run_starts() {
+        let mut rt = Runtime::new();
+        rt.record_to("/nonexistent_dir_kryhta/x.klog").unwrap();
+        let err = rt.eval_hosted("1 + 1").unwrap_err();
+        assert!(err.to_string().contains("cannot create log"), "{err}");
+    }
 }

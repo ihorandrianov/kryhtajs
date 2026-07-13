@@ -10,7 +10,7 @@ use crate::gc::GC;
 use crate::host::{CallId, HostValue, PendingCall, RunOutcome};
 use crate::object::{Object, ObjectKind};
 use crate::parser::Parser;
-use crate::replay::{LogHeader, LogMode, LogWriter};
+use crate::replay::{LogEvent, LogHeader, LogMode, LogWriter};
 use crate::string_pool::{StrId, StringPool};
 use crate::value::{JSValue, ObjId};
 
@@ -222,7 +222,8 @@ impl Runtime {
         self.ready_queue.push_back(FiberId(0));
         self.next_fiber_id = 1;
 
-        self.run_scheduler(ast)
+        let result = self.run_scheduler(ast);
+        self.finish_run(result)
     }
 
     /// Continue a runtime restored from a snapshot: enter the scheduler
@@ -234,9 +235,44 @@ impl Runtime {
     /// Re-enter the scheduler after `resume_with` — no per-run reset,
     /// mirroring `run_resumed`.
     pub fn run_hosted_continue(&mut self) -> Result<RunOutcome> {
+        if matches!(self.log, LogMode::Replaying) {
+            return Err(JSError::Message(
+                "run_hosted_continue: runtime is replaying".to_string(),
+            ));
+        }
+        if let LogMode::Recording(w) = &mut self.log {
+            if !w.done_written {
+                w.append(&LogEvent::Continue)?;
+            }
+        }
+        self.continue_scheduler()
+    }
+
+    pub(crate) fn continue_scheduler(&mut self) -> Result<RunOutcome> {
         let ast = std::mem::take(&mut self.ast);
         let result = self.run_scheduler(&ast);
         self.ast = ast;
+        self.finish_run(result)
+    }
+
+    /// Seal a completed recorded run with a Done event (once). The result
+    /// is recorded when it's plain data; code values record as None.
+    pub(crate) fn finish_run(&mut self, result: Result<RunOutcome>) -> Result<RunOutcome> {
+        let Ok(RunOutcome::Done(v)) = &result else {
+            return result;
+        };
+        if !matches!(self.log, LogMode::Recording(_)) {
+            return result;
+        }
+        let host_result = crate::host::to_host_value(&self.interpreter, *v).ok();
+        if let LogMode::Recording(w) = &mut self.log {
+            if !w.done_written {
+                w.append(&LogEvent::Done {
+                    result: host_result,
+                })?;
+                w.done_written = true;
+            }
+        }
         result
     }
 
@@ -275,20 +311,50 @@ impl Runtime {
     /// since fiber state is already the single source of truth for what's
     /// pending (see `pending_calls`).
     pub fn resume_with(&mut self, id: CallId, value: HostValue) -> Result<()> {
+        if matches!(self.log, LogMode::Replaying) {
+            return Err(JSError::Message(
+                "resume_with: runtime is replaying; answers come from the log".to_string(),
+            ));
+        }
         let fiber_id = id.0;
-        let is_pending = self
-            .fibers
-            .iter()
-            .any(|f| f.id == fiber_id && matches!(f.status, FiberStatus::BlockedOnHost { .. }));
-        if !is_pending {
+        let pending = self.fibers.iter().find_map(|f| match (&f.id, &f.status) {
+            (fid, FiberStatus::BlockedOnHost { effect, args }) if *fid == fiber_id => {
+                Some((*effect, args.clone()))
+            }
+            _ => None,
+        });
+        let Some((effect, args)) = pending else {
             return Err(JSError::Message(format!(
                 "resume_with: no pending host call for fiber {}",
                 fiber_id.0
             )));
+        };
+        if matches!(self.log, LogMode::Recording(_)) {
+            let effect_name = self
+                .interpreter
+                .strings
+                .get(effect)
+                .unwrap_or("")
+                .to_string();
+            let event = LogEvent::HostAnswer {
+                call_id: fiber_id.0,
+                effect: effect_name,
+                args,
+                answer: value.clone(),
+            };
+            if let LogMode::Recording(w) = &mut self.log {
+                // Write-ahead: if the append fails, the answer is NOT
+                // applied — the log never lags the runtime.
+                w.append(&event)?;
+            }
         }
-        let v = crate::host::from_host_value(&mut self.interpreter, &value);
-        self.unblock_fiber(fiber_id, v);
+        self.apply_host_answer(fiber_id, &value);
         Ok(())
+    }
+
+    pub(crate) fn apply_host_answer(&mut self, fiber_id: FiberId, value: &HostValue) {
+        let v = crate::host::from_host_value(&mut self.interpreter, value);
+        self.unblock_fiber(fiber_id, v);
     }
 
     /// Pending-call derivation (single source of truth — never stored).
