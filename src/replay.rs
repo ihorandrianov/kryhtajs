@@ -3,7 +3,9 @@
 //! See docs/superpowers/specs/2026-07-13-replay-log-design.md.
 
 use crate::error::{JSError, Result};
-use crate::host::HostValue;
+use crate::host::{HostValue, RunOutcome};
+use crate::parser::Parser;
+use crate::runtime::{FiberId, FiberStatus};
 use crate::snapshot::{read_host_value, write_host_value, ByteReader, ByteWriter};
 
 pub(crate) const LOG_MAGIC: &[u8; 4] = b"KRLG";
@@ -300,6 +302,139 @@ impl Runtime {
         };
         Ok(())
     }
+
+    /// Rebuild a run from its log: re-execute the embedded source, feeding
+    /// logged answers back with strict verification, then continue live —
+    /// recording — on the same file. This is both crash recovery and audit:
+    /// a divergence can only mean runtime nondeterminism or a tampered log,
+    /// never "the script changed", because the source comes from the log.
+    pub fn resume_from_log(path: &str) -> Result<(Runtime, RunOutcome)> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| JSError::Message(format!("replay log: cannot read {path}: {e}")))?;
+        let ParsedLog {
+            header,
+            events,
+            good_len,
+        } = parse_log(&bytes)?;
+
+        let mut rt = Runtime::new();
+        for name in &header.grants {
+            rt.grant(name)?;
+        }
+        rt.log = LogMode::Replaying;
+
+        // Mirror eval_hosted's parse-then-run, minus its mode guards.
+        let parser = Parser::with_state(
+            &header.source,
+            rt.interpreter.strings.clone(),
+            rt.ast.clone(),
+        )?;
+        let (arena, strings) = parser.parse_program()?;
+        rt.interpreter.strings = strings;
+        rt.ast = arena;
+        let ast = std::mem::take(&mut rt.ast);
+        let initial = rt.run_hosted_fresh(&ast);
+        rt.ast = ast;
+        let mut outcome = initial?;
+
+        let mut unflushed_answers = false;
+        let mut saw_done = false;
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                LogEvent::HostAnswer {
+                    call_id,
+                    effect,
+                    args,
+                    answer,
+                } => {
+                    rt.verify_pending_matches(*call_id, effect, args)
+                        .map_err(|e| {
+                            JSError::Message(format!("replay diverged at event {i}: {e}"))
+                        })?;
+                    rt.apply_host_answer(FiberId(*call_id), answer);
+                    unflushed_answers = true;
+                }
+                LogEvent::Continue => {
+                    outcome = rt.continue_scheduler()?;
+                    unflushed_answers = false;
+                }
+                LogEvent::Done { result } => {
+                    let RunOutcome::Done(v) = &outcome else {
+                        return Err(JSError::Message(format!(
+                            "replay diverged at event {i}: log records Done but the run is still pending"
+                        )));
+                    };
+                    if let Some(expected) = result {
+                        let actual = crate::host::to_host_value(&rt.interpreter, *v).ok();
+                        let matches =
+                            actual.as_ref().is_some_and(|a| host_value_bit_eq(a, expected));
+                        if !matches {
+                            return Err(JSError::Message(format!(
+                                "replay diverged at event {i}: final result does not match the recorded one"
+                            )));
+                        }
+                    }
+                    saw_done = true;
+                }
+            }
+        }
+
+        // Replay caught up — continue live, appending to the same file.
+        let mut writer = LogWriter::open_at(path, good_len)?;
+        writer.done_written = saw_done;
+        rt.log = LogMode::Recording(writer);
+
+        if unflushed_answers {
+            // The original host died between answering and continuing;
+            // perform the continue it would have (recording it, live).
+            outcome = rt.run_hosted_continue()?;
+        } else {
+            // Re-seal completion if the crash ate the Done record.
+            outcome = rt.finish_run(Ok(outcome))?;
+        }
+        Ok((rt, outcome))
+    }
+
+    /// Strict divergence check for one logged answer against live state.
+    fn verify_pending_matches(
+        &self,
+        call_id: u32,
+        effect: &str,
+        args: &[HostValue],
+    ) -> Result<()> {
+        let fiber_id = FiberId(call_id);
+        let Some(fiber) = self.fibers.iter().find(|f| f.id == fiber_id) else {
+            return Err(JSError::Message(format!(
+                "log answers call {call_id}, but no such fiber exists"
+            )));
+        };
+        let FiberStatus::BlockedOnHost {
+            effect: actual_effect,
+            args: actual_args,
+        } = &fiber.status
+        else {
+            return Err(JSError::Message(format!(
+                "log answers call {call_id}, but that fiber is not blocked on a host call"
+            )));
+        };
+        let actual_name = self.interpreter.strings.get(*actual_effect).unwrap_or("");
+        if actual_name != effect {
+            return Err(JSError::Message(format!(
+                "log answers effect '{effect}', but the run performed '{actual_name}'"
+            )));
+        }
+        let args_match = actual_args.len() == args.len()
+            && actual_args
+                .iter()
+                .zip(args)
+                .all(|(a, b)| host_value_bit_eq(a, b));
+        if !args_match {
+            return Err(JSError::Message(format!(
+                "args for effect '{effect}' do not match the log"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -567,5 +702,98 @@ mod tests {
         rt.record_to("/nonexistent_dir_kryhta/x.klog").unwrap();
         let err = rt.eval_hosted("1 + 1").unwrap_err();
         assert!(err.to_string().contains("cannot create log"), "{err}");
+    }
+
+    #[test]
+    fn flagship_record_crash_recover_then_full_replay() {
+        let path = temp_path("flagship.klog");
+        let script = "let a = perform Fork!(() => perform Ask!(\"one\"));\n\
+                      let b = perform Fork!(() => perform Ask!(\"two\"));\n\
+                      let ra = perform Join!(a);\n\
+                      let rb = perform Join!(b);\n\
+                      [ra.ok, rb.ok]";
+
+        // original run: answer only "one", then the process "dies"
+        let mut rt = Runtime::new();
+        rt.grant("Ask").unwrap();
+        rt.record_to(&path).unwrap();
+        let RunOutcome::Pending(calls) = rt.eval_hosted(script).unwrap() else {
+            panic!()
+        };
+        let one = calls
+            .iter()
+            .find(|c| c.args == vec![HV::Str("one".into())])
+            .unwrap();
+        rt.resume_with(one.id, HV::Int(10)).unwrap();
+        let expected_two_id = calls
+            .iter()
+            .find(|c| c.args == vec![HV::Str("two".into())])
+            .unwrap()
+            .id;
+        drop(rt);
+
+        // recovery: replay catches up and surfaces the unanswered call
+        let (mut rt2, outcome) = Runtime::resume_from_log(&path).unwrap();
+        let RunOutcome::Pending(remaining) = outcome else {
+            panic!("expected the unanswered call to resurface");
+        };
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, expected_two_id);
+        assert_eq!(remaining[0].effect, "Ask");
+        assert_eq!(remaining[0].args, vec![HV::Str("two".into())]);
+
+        rt2.resume_with(remaining[0].id, HV::Int(20)).unwrap();
+        let RunOutcome::Done(v) = rt2.run_hosted_continue().unwrap() else {
+            panic!()
+        };
+        let hv = crate::host::to_host_value(&rt2.interpreter, v).unwrap();
+        assert_eq!(hv, HV::Array(vec![HV::Int(10), HV::Int(20)]));
+        drop(rt2);
+
+        // the healed log now replays end-to-end without any live answers
+        let (_rt3, outcome) = Runtime::resume_from_log(&path).unwrap();
+        let RunOutcome::Done(_) = outcome else {
+            panic!("complete log must replay straight to Done");
+        };
+        let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(matches!(
+            parsed.events.last(),
+            Some(LogEvent::Done { result: Some(_) })
+        ));
+    }
+
+    #[test]
+    fn replay_is_self_contained_no_script_needed() {
+        let path = temp_path("selfcontained.klog");
+        let mut rt = Runtime::new();
+        rt.record_to(&path).unwrap();
+        rt.eval_hosted("40 + 2").unwrap();
+        drop(rt);
+        let (_rt, outcome) = Runtime::resume_from_log(&path).unwrap();
+        let RunOutcome::Done(v) = outcome else { panic!() };
+        assert_eq!(v, crate::value::JSValue::Int(42));
+    }
+
+    #[test]
+    fn mid_batch_crash_auto_continues_and_heals_the_log() {
+        let path = temp_path("midbatch.klog");
+        let mut rt = Runtime::new();
+        rt.grant("Ask").unwrap();
+        rt.record_to(&path).unwrap();
+        let RunOutcome::Pending(calls) = rt.eval_hosted("perform Ask!(\"q\")").unwrap() else {
+            panic!()
+        };
+        // answer but never call run_hosted_continue — died mid-batch
+        rt.resume_with(calls[0].id, HV::Int(5)).unwrap();
+        drop(rt);
+
+        let (_rt2, outcome) = Runtime::resume_from_log(&path).unwrap();
+        let RunOutcome::Done(v) = outcome else {
+            panic!("auto-continue must finish the run");
+        };
+        assert_eq!(v, crate::value::JSValue::Int(5));
+        // the auto-continue and completion were recorded
+        let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(matches!(parsed.events.last(), Some(LogEvent::Done { .. })));
     }
 }
