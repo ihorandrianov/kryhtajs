@@ -6,7 +6,7 @@ use kryhta::{HostValue, Result, RunOutcome, Runtime};
 
 fn main() -> Result<()> {
     let mut rt = Runtime::new();
-    rt.grant("AskHuman");
+    rt.grant("AskHuman")?;
 
     let mut outcome = rt.eval_hosted(
         "let answer = perform AskHuman!(\"Approve the deploy?\");\n\

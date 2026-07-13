@@ -10,6 +10,7 @@ use crate::gc::GC;
 use crate::host::{CallId, HostValue, PendingCall, RunOutcome};
 use crate::object::{Object, ObjectKind};
 use crate::parser::Parser;
+use crate::replay::{LogHeader, LogMode, LogWriter};
 use crate::string_pool::{StrId, StringPool};
 use crate::value::{JSValue, ObjId};
 
@@ -82,6 +83,8 @@ pub struct Runtime {
     /// or granted to cross the host boundary. Anything else faults at the
     /// perform site unless an in-language handler catches it first.
     pub effects: HashMap<StrId, EffectKind>,
+    /// Replay-log state. Off by default; see src/replay.rs.
+    pub(crate) log: LogMode,
 }
 
 impl Runtime {
@@ -113,14 +116,36 @@ impl Runtime {
             gc: GC::new(),
             ast: AstArena::new(),
             effects,
+            log: LogMode::Off,
         }
     }
 
     /// Grant the script permission to perform `name` as a host effect.
-    /// Ungranted, unhandled effects fail at the perform site.
-    pub fn grant(&mut self, name: &str) {
+    /// Ungranted, unhandled effects fail at the perform site. Grants are
+    /// frozen once a recorded or replaying run starts: the log header is
+    /// the single source of truth for what the run was allowed to do.
+    pub fn grant(&mut self, name: &str) -> Result<()> {
+        if matches!(self.log, LogMode::Recording(_) | LogMode::Replaying) {
+            return Err(JSError::Message(
+                "grant: grants are frozen once a recorded run starts".to_string(),
+            ));
+        }
         let id = self.interpreter.strings.intern(name);
         self.effects.insert(id, EffectKind::Host);
+        Ok(())
+    }
+
+    /// Host-granted effect names, sorted so the log header is byte-stable
+    /// regardless of HashMap iteration order.
+    pub(crate) fn granted_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .effects
+            .iter()
+            .filter(|(_, kind)| matches!(kind, EffectKind::Host))
+            .map(|(id, _)| self.interpreter.strings.get(*id).unwrap_or("").to_string())
+            .collect();
+        names.sort();
+        names
     }
 
     /// Reconstruct a runtime from bytes produced by `snapshot::write_runtime`.
@@ -166,6 +191,16 @@ impl Runtime {
     }
 
     pub fn run_hosted(&mut self, ast: &AstArena) -> Result<RunOutcome> {
+        if !matches!(self.log, LogMode::Off) {
+            return Err(JSError::Message(
+                "run_hosted: a recorded run must start via eval_hosted (the log header embeds the source text)"
+                    .to_string(),
+            ));
+        }
+        self.run_hosted_fresh(ast)
+    }
+
+    pub(crate) fn run_hosted_fresh(&mut self, ast: &AstArena) -> Result<RunOutcome> {
         self.interpreter.fresh_exec_setup(ast)?;
 
         // Each run is a fresh top-level execution: fibers from a previous
@@ -206,14 +241,31 @@ impl Runtime {
     }
 
     pub fn eval_hosted(&mut self, source: &str) -> Result<RunOutcome> {
+        if matches!(self.log, LogMode::Recording(_) | LogMode::Replaying) {
+            return Err(JSError::Message(
+                "eval_hosted: a recorded or replaying run is already active on this runtime"
+                    .to_string(),
+            ));
+        }
         let parser =
             Parser::with_state(source, self.interpreter.strings.clone(), self.ast.clone())?;
         let (arena, strings) = parser.parse_program()?;
         self.interpreter.strings = strings;
         self.ast = arena;
 
+        if matches!(self.log, LogMode::Armed { .. }) {
+            let LogMode::Armed { path } = std::mem::replace(&mut self.log, LogMode::Off) else {
+                unreachable!("checked by matches! above");
+            };
+            let header = LogHeader {
+                source: source.to_string(),
+                grants: self.granted_names(),
+            };
+            self.log = LogMode::Recording(LogWriter::create(&path, &header)?);
+        }
+
         let ast = std::mem::take(&mut self.ast);
-        let result = self.run_hosted(&ast);
+        let result = self.run_hosted_fresh(&ast);
         self.ast = ast;
         result
     }
@@ -678,7 +730,7 @@ mod host_effect_tests {
     fn granted_effect_blocks_the_fiber() {
         use crate::host::RunOutcome;
         let mut rt = Runtime::new();
-        rt.grant("Ask");
+        rt.grant("Ask").unwrap();
         // eval_hosted surfaces the block as RunOutcome::Pending rather than
         // leaving the caller to inspect fiber internals.
         let outcome = rt.eval_hosted("perform Ask!(\"q\")").unwrap();
@@ -698,7 +750,7 @@ mod host_effect_tests {
     fn host_effect_suspends_and_resumes_end_to_end() {
         use crate::host::{HostValue, RunOutcome};
         let mut rt = Runtime::new();
-        rt.grant("Ask");
+        rt.grant("Ask").unwrap();
         let outcome = rt.eval_hosted("perform Ask!(\"q\", 42)").unwrap();
         let RunOutcome::Pending(calls) = outcome else {
             panic!("expected Pending");
@@ -724,7 +776,7 @@ mod host_effect_tests {
     #[test]
     fn plain_eval_errors_when_a_host_call_surfaces() {
         let mut rt = Runtime::new();
-        rt.grant("Ask");
+        rt.grant("Ask").unwrap();
         let err = rt.eval("perform Ask!(1)").unwrap_err();
         assert!(err.to_string().contains("Ask"), "{err}");
         assert!(err.to_string().contains("run_hosted"), "{err}");
@@ -743,7 +795,7 @@ mod host_effect_tests {
     #[test]
     fn in_language_handler_beats_a_grant() {
         let mut rt = Runtime::new();
-        rt.grant("Ask");
+        rt.grant("Ask").unwrap();
         let v = rt
             .eval("handle { perform Ask!(1) } with { Ask!(x, resume) -> resume(x + 1) }")
             .unwrap();
@@ -753,7 +805,7 @@ mod host_effect_tests {
     #[test]
     fn unconvertible_args_fault_at_perform_site() {
         let mut rt = Runtime::new();
-        rt.grant("Ask");
+        rt.grant("Ask").unwrap();
         let err = rt.eval("perform Ask!((x) => x)").unwrap_err();
         assert!(err.to_string().contains("cannot convert"), "{err}");
     }
@@ -762,7 +814,7 @@ mod host_effect_tests {
     fn two_fibers_pend_concurrently_and_answer_out_of_order() {
         use crate::host::{HostValue, RunOutcome};
         let mut rt = Runtime::new();
-        rt.grant("Ask");
+        rt.grant("Ask").unwrap();
         let outcome = rt
             .eval_hosted(
                 "let a = perform Fork!(() => perform Ask!(\"first\"));\n\
@@ -804,7 +856,7 @@ mod host_effect_tests {
     fn answering_a_subset_returns_the_remainder() {
         use crate::host::{HostValue, RunOutcome};
         let mut rt = Runtime::new();
-        rt.grant("Ask");
+        rt.grant("Ask").unwrap();
         let outcome = rt
             .eval_hosted(
                 "let a = perform Fork!(() => perform Ask!(\"one\"));\n\
@@ -848,7 +900,7 @@ mod host_effect_tests {
     fn root_result_survives_while_child_pends() {
         use crate::host::{HostValue, RunOutcome};
         let mut rt = Runtime::new();
-        rt.grant("Ask");
+        rt.grant("Ask").unwrap();
         // The root fiber forks a child that blocks on a host effect, then
         // completes on its own. run_hosted_continue must report the root's
         // recorded result once the child is answered, not Undefined.
@@ -873,7 +925,7 @@ mod host_effect_tests {
     fn pending_host_call_survives_snapshot_round_trip() {
         use crate::host::{HostValue, RunOutcome};
         let mut rt = Runtime::new();
-        rt.grant("Ask");
+        rt.grant("Ask").unwrap();
         let RunOutcome::Pending(calls) = rt.eval_hosted("perform Ask!(\"q\")").unwrap() else {
             panic!()
         };
@@ -904,7 +956,7 @@ mod host_effect_tests {
     fn pending_call_args_are_frozen_at_block_time_not_drain_time() {
         use crate::host::{HostValue, RunOutcome};
         let mut rt = Runtime::new();
-        rt.grant("Ask");
+        rt.grant("Ask").unwrap();
         // `a` forks first, so it lands at the front of the ready queue and
         // runs (and blocks on Ask, converting `o`) before `b` gets a turn.
         // `b` then mutates the same shared object. If conversion happened at

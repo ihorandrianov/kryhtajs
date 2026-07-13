@@ -318,7 +318,7 @@ fn test_host_effect_survives_process_boundary() {
 
     // "Process 1": suspend on a tool call, checkpoint, die.
     let mut rt = Runtime::new();
-    rt.grant("FetchUrl");
+    rt.grant("FetchUrl").unwrap();
     let outcome = rt
         .eval_hosted("perform FetchUrl!(\"https://example.com\")")
         .unwrap();

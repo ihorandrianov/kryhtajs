@@ -2211,6 +2211,8 @@ pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
         gc,
         ast,
         effects,
+        // A restored runtime never inherits log mode — LogMode is runtime-local.
+        log: crate::replay::LogMode::Off,
     })
 }
 
@@ -3136,7 +3138,7 @@ mod tests {
     fn effect_registry_round_trips_including_grants() {
         use crate::runtime::{EffectKind, Runtime};
         let mut rt = Runtime::new();
-        rt.grant("FetchUrl");
+        rt.grant("FetchUrl").unwrap();
         let bytes = write_runtime(&rt, &rt.ready_queue.clone());
         let mut rt2 = read_runtime(&bytes).unwrap();
         // StringPool has no `lookup(&str)`; `intern` returns the existing id

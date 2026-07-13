@@ -215,6 +215,93 @@ pub(crate) fn host_value_bit_eq(a: &HostValue, b: &HostValue) -> bool {
     }
 }
 
+fn io_err(context: &str, e: std::io::Error) -> JSError {
+    JSError::Message(format!("replay log: {context}: {e}"))
+}
+
+pub(crate) struct LogWriter {
+    file: std::fs::File,
+    /// Once Done is on disk the run is over; guards against a host loop
+    /// calling run_hosted_continue again and appending events after Done.
+    pub(crate) done_written: bool,
+}
+
+impl LogWriter {
+    pub(crate) fn create(path: &str, header: &LogHeader) -> Result<Self> {
+        use std::io::Write;
+        let mut file =
+            std::fs::File::create(path).map_err(|e| io_err("cannot create log", e))?;
+        file.write_all(&encode_header(header))
+            .map_err(|e| io_err("cannot write header", e))?;
+        file.sync_data().map_err(|e| io_err("cannot sync", e))?;
+        Ok(Self {
+            file,
+            done_written: false,
+        })
+    }
+
+    /// Reopen for appending after replay. Truncates to `good_len` first,
+    /// dropping any torn tail a crash left behind.
+    pub(crate) fn open_at(path: &str, good_len: u64) -> Result<Self> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| io_err("cannot open log", e))?;
+        file.set_len(good_len)
+            .map_err(|e| io_err("cannot truncate torn tail", e))?;
+        file.seek(SeekFrom::End(0))
+            .map_err(|e| io_err("cannot seek", e))?;
+        Ok(Self {
+            file,
+            done_written: false,
+        })
+    }
+
+    /// Write-ahead: synced to disk before the caller applies the event to
+    /// the runtime, so the log never lags the state it explains.
+    pub(crate) fn append(&mut self, event: &LogEvent) -> Result<()> {
+        use std::io::Write;
+        self.file
+            .write_all(&encode_event(event))
+            .map_err(|e| io_err("cannot append", e))?;
+        self.file.sync_data().map_err(|e| io_err("cannot sync", e))
+    }
+}
+
+pub(crate) enum LogMode {
+    Off,
+    /// record_to was called; the header (which needs the source text) is
+    /// written when eval_hosted starts the run.
+    Armed { path: String },
+    Recording(LogWriter),
+    Replaying,
+}
+
+use crate::runtime::Runtime;
+
+impl Runtime {
+    /// Arm recording. The run itself must start via `eval_hosted` — the
+    /// header embeds the source text, which AST entry points don't have.
+    pub fn record_to(&mut self, path: &str) -> Result<()> {
+        if self.next_fiber_id != 0 || !self.fibers.is_empty() {
+            return Err(JSError::Message(
+                "record_to: recording requires a fresh runtime (one that has not run and was not snapshot-restored)"
+                    .to_string(),
+            ));
+        }
+        if !matches!(self.log, LogMode::Off) {
+            return Err(JSError::Message(
+                "record_to: a log is already attached to this runtime".to_string(),
+            ));
+        }
+        self.log = LogMode::Armed {
+            path: path.to_string(),
+        };
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +418,67 @@ mod tests {
             &Object(vec![("a".to_string(), Null)]),
             &Object(vec![("b".to_string(), Null)])
         ));
+    }
+
+    use crate::runtime::Runtime;
+
+    fn temp_path(name: &str) -> String {
+        let dir = std::env::temp_dir().join("kryhta_replay_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name).to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn record_to_requires_a_fresh_runtime() {
+        let mut rt = Runtime::new();
+        rt.eval("1 + 1").unwrap();
+        let err = rt.record_to(&temp_path("used.klog")).unwrap_err();
+        assert!(err.to_string().contains("fresh runtime"), "{err}");
+    }
+
+    #[test]
+    fn record_to_rejects_a_snapshot_restored_runtime() {
+        let mut rt = Runtime::new();
+        rt.grant("Ask").unwrap();
+        rt.eval_hosted("perform Ask!(1)").unwrap();
+        let ready = rt.ready_queue.clone();
+        let bytes = crate::snapshot::write_runtime(&rt, &ready);
+        let mut rt2 = Runtime::from_snapshot(&bytes).unwrap();
+        let err = rt2.record_to(&temp_path("restored.klog")).unwrap_err();
+        assert!(err.to_string().contains("fresh runtime"), "{err}");
+    }
+
+    #[test]
+    fn recorded_eval_writes_the_header() {
+        let path = temp_path("header.klog");
+        let mut rt = Runtime::new();
+        rt.grant("Zeta").unwrap();
+        rt.grant("Ask").unwrap();
+        rt.record_to(&path).unwrap();
+        rt.eval_hosted("perform Ask!(\"q\")").unwrap();
+        let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(parsed.header.source, "perform Ask!(\"q\")");
+        // sorted for byte-stable headers regardless of grant order
+        assert_eq!(parsed.header.grants, vec!["Ask".to_string(), "Zeta".to_string()]);
+    }
+
+    #[test]
+    fn grants_freeze_once_a_recorded_run_starts() {
+        let path = temp_path("frozen.klog");
+        let mut rt = Runtime::new();
+        rt.grant("Ask").unwrap();
+        rt.record_to(&path).unwrap();
+        rt.eval_hosted("perform Ask!(1)").unwrap();
+        let err = rt.grant("Late").unwrap_err();
+        assert!(err.to_string().contains("frozen"), "{err}");
+    }
+
+    #[test]
+    fn armed_runtime_rejects_ast_entry_points() {
+        let path = temp_path("armed.klog");
+        let mut rt = Runtime::new();
+        rt.record_to(&path).unwrap();
+        let err = rt.eval("1 + 1").unwrap_err();
+        assert!(err.to_string().contains("eval_hosted"), "{err}");
     }
 }
