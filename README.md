@@ -109,7 +109,7 @@ use kryhta::{HostValue, Result, RunOutcome, Runtime};
 
 fn main() -> Result<()> {
     let mut rt = Runtime::new();
-    rt.grant("AskHuman");
+    rt.grant("AskHuman")?;
 
     let mut outcome = rt.eval_hosted(
         "let answer = perform AskHuman!(\"Approve the deploy?\");\n\
@@ -139,6 +139,33 @@ fn main() -> Result<()> {
   same call.
 
 Run `cargo run --example host_effect` to see this loop end to end.
+
+## Deterministic replay log
+
+Every host answer can be recorded, write-ahead, to an append-only binary
+log. The log embeds the script source and grant set, so **source + log =
+the run**: a new process can rebuild the exact state by re-executing the
+script and feeding answers from the log — no snapshot needed.
+
+    let mut rt = Runtime::new();
+    rt.grant("FetchUrl")?;
+    rt.record_to("run.klog")?;          // arm recording
+    let outcome = rt.eval_hosted(src)?; // header written; run recorded
+    // ... normal host loop: resume_with / run_hosted_continue ...
+
+    // later, in a different process:
+    let (mut rt, outcome) = Runtime::resume_from_log("run.klog")?;
+    // replay caught up; unanswered calls resurface and recording continues
+
+Replay verifies every step strictly — call id, effect name, and bit-exact
+arguments must match the log, and the final result is checked against the
+recorded one. A mismatch is a divergence error, never silent corruption.
+Since the source is embedded, divergence can only mean nondeterminism or a
+tampered log. Replay is read-only reconstruction: `Snapshot!` effects
+don't re-write files (`Print!` re-runs, by design — the output is part of
+the audit trail).
+
+CLI: `kryhta --record run.klog script.js`, then `kryhta --replay run.klog`.
 
 ## License
 
