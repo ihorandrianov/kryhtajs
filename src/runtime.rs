@@ -20,6 +20,8 @@ pub struct FiberId(pub u32);
 pub enum FiberStatus {
     Ready,
     Running,
+    /// Never constructed anywhere; kept because snapshot tag 2 encodes it —
+    /// removing the variant would orphan the tag in the v2 wire format.
     Blocked { effect: StrId, args: Vec<JSValue> },
     BlockedOnHost { effect: StrId, args: Vec<HostValue> },
     Completed(JSValue),

@@ -256,7 +256,22 @@ fn write_host_value(w: &mut ByteWriter, v: &HostValue) {
     }
 }
 
+/// Recursion guard for `read_host_value`: this is the codec's only
+/// recursive decoder, so a crafted snapshot of nested Array/Object tags
+/// (~5 bytes per level) could otherwise overflow the stack. Real values
+/// can't get this deep — cycles are rejected at the host boundary.
+const MAX_HOST_VALUE_DEPTH: u32 = 256;
+
 fn read_host_value(r: &mut ByteReader) -> Result<HostValue> {
+    read_host_value_at(r, 0)
+}
+
+fn read_host_value_at(r: &mut ByteReader, depth: u32) -> Result<HostValue> {
+    if depth > MAX_HOST_VALUE_DEPTH {
+        return Err(JSError::Message(
+            "snapshot: host value nested too deep".to_string(),
+        ));
+    }
     Ok(match r.u8()? {
         0 => HostValue::Undefined,
         1 => HostValue::Null,
@@ -268,7 +283,7 @@ fn read_host_value(r: &mut ByteReader) -> Result<HostValue> {
             let n = r.u32()? as usize;
             let mut items = Vec::with_capacity(n.min(1 << 16));
             for _ in 0..n {
-                items.push(read_host_value(r)?);
+                items.push(read_host_value_at(r, depth + 1)?);
             }
             HostValue::Array(items)
         }
@@ -277,7 +292,7 @@ fn read_host_value(r: &mut ByteReader) -> Result<HostValue> {
             let mut pairs = Vec::with_capacity(n.min(1 << 16));
             for _ in 0..n {
                 let key = r.str_()?;
-                let value = read_host_value(r)?;
+                let value = read_host_value_at(r, depth + 1)?;
                 pairs.push((key, value));
             }
             HostValue::Object(pairs)
@@ -3158,5 +3173,34 @@ mod tests {
                 HostValue::Object(vec![("k".to_string(), HostValue::Null)]),
             ]
         );
+    }
+
+    #[test]
+    fn deeply_nested_host_value_errors_instead_of_overflowing() {
+        // Crafted input: 300 one-element Array headers with no real payload
+        // behind them — cheap bytes, unbounded recursion if uncapped.
+        let mut w = ByteWriter::new();
+        for _ in 0..300 {
+            w.u8(6);
+            w.u32(1);
+        }
+        w.u8(1);
+        let bytes = w.finish();
+        let mut r = ByteReader::new(&bytes);
+        let err = read_host_value(&mut r).unwrap_err();
+        assert!(err.to_string().contains("too deep"), "{err}");
+    }
+
+    #[test]
+    fn host_value_nesting_below_the_cap_round_trips() {
+        let mut v = HostValue::Int(1);
+        for _ in 0..200 {
+            v = HostValue::Array(vec![v]);
+        }
+        let mut w = ByteWriter::new();
+        write_host_value(&mut w, &v);
+        let bytes = w.finish();
+        let mut r = ByteReader::new(&bytes);
+        assert_eq!(read_host_value(&mut r).unwrap(), v);
     }
 }
