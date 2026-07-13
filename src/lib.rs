@@ -21,6 +21,7 @@ pub mod host;
 pub mod lexer;
 pub mod object;
 pub mod parser;
+pub mod replay;
 pub mod runtime;
 pub mod snapshot;
 pub mod string_pool;

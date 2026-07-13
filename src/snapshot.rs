@@ -133,6 +133,10 @@ impl<'a> ByteReader<'a> {
     pub fn is_at_end(&self) -> bool {
         self.pos == self.buf.len()
     }
+
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
 }
 
 fn write_value(w: &mut ByteWriter, v: JSValue) {
@@ -218,7 +222,7 @@ fn read_seq_values(r: &mut ByteReader) -> Result<Vec<JSValue>> {
 
 // HostValue is self-contained (owns its Strings, no arena ids), so unlike
 // `write_value`/`read_value` this codec needs no runtime/interner access.
-fn write_host_value(w: &mut ByteWriter, v: &HostValue) {
+pub(crate) fn write_host_value(w: &mut ByteWriter, v: &HostValue) {
     match v {
         HostValue::Undefined => w.u8(0),
         HostValue::Null => w.u8(1),
@@ -262,7 +266,7 @@ fn write_host_value(w: &mut ByteWriter, v: &HostValue) {
 /// can't get this deep — cycles are rejected at the host boundary.
 const MAX_HOST_VALUE_DEPTH: u32 = 256;
 
-fn read_host_value(r: &mut ByteReader) -> Result<HostValue> {
+pub(crate) fn read_host_value(r: &mut ByteReader) -> Result<HostValue> {
     read_host_value_at(r, 0)
 }
 
