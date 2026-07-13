@@ -942,4 +942,31 @@ mod tests {
         let (_rt, outcome) = Runtime::resume_from_log(&path).unwrap();
         assert!(matches!(outcome, RunOutcome::Done(_)));
     }
+
+    #[test]
+    fn snapshot_effect_is_suppressed_during_replay() {
+        let dir = std::env::temp_dir().join("kryhta_replay_test");
+        let snap = dir.join("replayed.snap");
+        let log = temp_path("with_snapshot.klog");
+        let script = format!(
+            "let outcome = perform Snapshot!(\"{}\");\n outcome",
+            snap.to_str().unwrap()
+        );
+        let mut rt = Runtime::new();
+        rt.record_to(&log).unwrap();
+        rt.eval_hosted(&script).unwrap();
+        drop(rt);
+        assert!(snap.exists(), "the recorded run wrote the snapshot");
+        std::fs::remove_file(&snap).unwrap();
+
+        let (rt2, outcome) = Runtime::resume_from_log(&log).unwrap();
+        assert!(
+            !snap.exists(),
+            "replay is read-only reconstruction: no snapshot files"
+        );
+        let RunOutcome::Done(crate::value::JSValue::String(id)) = outcome else {
+            panic!("expected the Snapshot! outcome string");
+        };
+        assert_eq!(rt2.interpreter.strings.get(id), Some("saved"));
+    }
 }

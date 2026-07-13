@@ -696,17 +696,15 @@ impl Runtime {
         let mut ready = self.ready_queue.clone();
         ready.push_front(fiber_id);
 
-        // `eval`/`run_resumed` move the session AST out of `self.ast` into a
-        // local for the duration of the run (to satisfy the borrow checker),
-        // passing it down to us as `ast`. `write_runtime` serializes
-        // `rt.ast`, so without this it would snapshot an empty arena.
-        // Swap it in just for the write, then restore whatever was there
-        // before (rather than assuming empty) so we don't clobber state a
-        // caller may have left in `self.ast`.
-        let prev_ast = std::mem::replace(&mut self.ast, ast.clone());
-        let bytes = crate::snapshot::write_runtime(self, &ready);
-        self.ast = prev_ast;
-        crate::snapshot::write_snapshot_file(&path, &bytes)?;
+        // Replay is read-only reconstruction: the original run already
+        // wrote this snapshot, and on a from-start run Snapshot! always
+        // returned "saved" — deterministic, so nothing needs the log.
+        if !matches!(self.log, LogMode::Replaying) {
+            let prev_ast = std::mem::replace(&mut self.ast, ast.clone());
+            let bytes = crate::snapshot::write_runtime(self, &ready);
+            self.ast = prev_ast;
+            crate::snapshot::write_snapshot_file(&path, &bytes)?;
+        }
 
         // The live run continues, seeing "saved".
         self.interpreter.control = Control::Value(JSValue::String(saved));
