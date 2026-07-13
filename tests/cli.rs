@@ -54,3 +54,43 @@ fn resume_rejects_garbage_files() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("snapshot"));
 }
+
+#[test]
+fn record_then_replay_reproduces_the_run() {
+    let dir = std::env::temp_dir().join("kryhta_cli_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("run.klog");
+    let script = dir.join("pure.js");
+    std::fs::write(&script, "perform Print!(\"hi\"); 40 + 2").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_kryhta");
+
+    let rec = Command::new(bin)
+        .arg("--record")
+        .arg(&log)
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(rec.status.success(), "{}", String::from_utf8_lossy(&rec.stderr));
+    assert!(String::from_utf8_lossy(&rec.stdout).contains("42"));
+
+    // self-contained: no script argument, source comes from the log
+    let rep = Command::new(bin).arg("--replay").arg(&log).output().unwrap();
+    assert!(rep.status.success(), "{}", String::from_utf8_lossy(&rep.stderr));
+    let out = String::from_utf8_lossy(&rep.stdout);
+    assert!(out.contains("hi"), "Print re-runs live during replay: {out}");
+    assert!(out.contains("42"));
+}
+
+#[test]
+fn replay_rejects_garbage_logs() {
+    let dir = std::env::temp_dir().join("kryhta_cli_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("garbage.klog");
+    std::fs::write(&bad, b"not a log").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_kryhta");
+    let out = Command::new(bin).arg("--replay").arg(&bad).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("replay log"));
+}

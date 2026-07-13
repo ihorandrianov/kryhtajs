@@ -2,7 +2,7 @@
 //!
 //! Uses Runtime with CEKH machine for direct AST interpretation.
 
-use kryhta::{JSError, JSValue, Result, Runtime};
+use kryhta::{JSError, JSValue, Result, RunOutcome, Runtime};
 
 use std::io::{self, BufRead, Write};
 
@@ -14,6 +14,20 @@ fn main() -> Result<()> {
             Some(path) => resume(path),
             None => {
                 eprintln!("Error: Usage: kryhta --resume <file.snap>");
+                std::process::exit(1);
+            }
+        },
+        Some("--record") => match (args.get(2), args.get(3)) {
+            (Some(log), Some(script)) => record(log, script),
+            _ => {
+                eprintln!("Error: Usage: kryhta --record <file.klog> <script.js>");
+                std::process::exit(1);
+            }
+        },
+        Some("--replay") => match args.get(2) {
+            Some(path) => replay_log(path),
+            None => {
+                eprintln!("Error: Usage: kryhta --replay <file.klog>");
                 std::process::exit(1);
             }
         },
@@ -58,6 +72,51 @@ fn resume(path: &str) -> Result<()> {
         }
         Err(e) => {
             eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn record(log_path: &str, script_path: &str) -> Result<()> {
+    let source = std::fs::read_to_string(script_path)
+        .map_err(|_| JSError::InternalError("Failed to read file"))?;
+    let mut runtime = Runtime::new();
+    if let Err(e) = runtime
+        .record_to(log_path)
+        .and_then(|_| runtime.eval_hosted(&source))
+        .map(|outcome| report_outcome(outcome, &runtime))
+    {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn replay_log(path: &str) -> Result<()> {
+    match Runtime::resume_from_log(path) {
+        Ok((runtime, outcome)) => {
+            report_outcome(outcome, &runtime);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn report_outcome(outcome: RunOutcome, runtime: &Runtime) {
+    match outcome {
+        RunOutcome::Done(result) => {
+            if !matches!(result, JSValue::Undefined) {
+                print_value(&result, runtime);
+            }
+        }
+        RunOutcome::Pending(calls) => {
+            eprintln!(
+                "Error: run is waiting on host effect '{}'; the CLI has no host tools — answer it from a Rust embedder",
+                calls[0].effect
+            );
             std::process::exit(1);
         }
     }
