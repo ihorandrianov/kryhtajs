@@ -796,4 +796,150 @@ mod tests {
         let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
         assert!(matches!(parsed.events.last(), Some(LogEvent::Done { .. })));
     }
+
+    /// A log whose single event is forged; the genuine run performs
+    /// Ask!("q") and any mismatch with the forged record must diverge.
+    fn forged_log(path: &str, event: LogEvent) -> String {
+        let p = temp_path(path);
+        let header = LogHeader {
+            source: "perform Ask!(\"q\")".to_string(),
+            grants: vec!["Ask".to_string()],
+        };
+        let mut bytes = encode_header(&header);
+        bytes.extend_from_slice(&encode_event(&event));
+        std::fs::write(&p, &bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn tampered_args_diverge() {
+        let p = forged_log(
+            "tamper_args.klog",
+            LogEvent::HostAnswer {
+                call_id: 0,
+                effect: "Ask".to_string(),
+                args: vec![HV::Str("FORGED".into())],
+                answer: HV::Int(1),
+            },
+        );
+        let Err(err) = Runtime::resume_from_log(&p) else {
+            panic!("expected error");
+        };
+        assert!(err.to_string().contains("diverged at event 0"), "{err}");
+        assert!(err.to_string().contains("args"), "{err}");
+    }
+
+    #[test]
+    fn tampered_effect_name_diverges() {
+        let p = forged_log(
+            "tamper_effect.klog",
+            LogEvent::HostAnswer {
+                call_id: 0,
+                effect: "Evil".to_string(),
+                args: vec![HV::Str("q".into())],
+                answer: HV::Int(1),
+            },
+        );
+        let Err(err) = Runtime::resume_from_log(&p) else {
+            panic!("expected error");
+        };
+        assert!(err.to_string().contains("'Evil'"), "{err}");
+    }
+
+    #[test]
+    fn tampered_call_id_diverges() {
+        let p = forged_log(
+            "tamper_id.klog",
+            LogEvent::HostAnswer {
+                call_id: 42,
+                effect: "Ask".to_string(),
+                args: vec![HV::Str("q".into())],
+                answer: HV::Int(1),
+            },
+        );
+        let Err(err) = Runtime::resume_from_log(&p) else {
+            panic!("expected error");
+        };
+        assert!(err.to_string().contains("no such fiber"), "{err}");
+    }
+
+    #[test]
+    fn premature_done_diverges() {
+        let p = forged_log("early_done.klog", LogEvent::Done { result: None });
+        let Err(err) = Runtime::resume_from_log(&p) else {
+            panic!("expected error");
+        };
+        assert!(err.to_string().contains("still pending"), "{err}");
+    }
+
+    #[test]
+    fn tampered_final_result_diverges() {
+        let path = temp_path("tamper_done.klog");
+        let mut rt = Runtime::new();
+        rt.record_to(&path).unwrap();
+        rt.eval_hosted("40 + 2").unwrap();
+        drop(rt);
+        // rewrite the log with a forged Done value
+        let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
+        let mut bytes = encode_header(&parsed.header);
+        bytes.extend_from_slice(&encode_event(&LogEvent::Done {
+            result: Some(HV::Int(999)),
+        }));
+        std::fs::write(&path, &bytes).unwrap();
+        let Err(err) = Runtime::resume_from_log(&path) else {
+            panic!("expected error");
+        };
+        assert!(err.to_string().contains("final result"), "{err}");
+    }
+
+    #[test]
+    fn torn_tail_recovers_and_reseals_the_log() {
+        let path = temp_path("torn.klog");
+        let mut rt = Runtime::new();
+        rt.grant("Ask").unwrap();
+        rt.record_to(&path).unwrap();
+        let RunOutcome::Pending(calls) = rt.eval_hosted("perform Ask!(\"q\")").unwrap() else {
+            panic!()
+        };
+        rt.resume_with(calls[0].id, HV::Int(5)).unwrap();
+        rt.run_hosted_continue().unwrap();
+        drop(rt);
+
+        // crash mid-append: chop bytes off the tail (into the Done record)
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..full.len() - 3]).unwrap();
+
+        let (_rt, outcome) = Runtime::resume_from_log(&path).unwrap();
+        let RunOutcome::Done(v) = outcome else { panic!() };
+        assert_eq!(v, crate::value::JSValue::Int(5));
+        // the tail was truncated and Done re-sealed: the log parses complete
+        let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(matches!(parsed.events.last(), Some(LogEvent::Done { .. })));
+    }
+
+    #[test]
+    fn nan_crossing_the_boundary_replays_without_false_divergence() {
+        let path = temp_path("nan.klog");
+        let script = "let x = perform Ask!(\"gimme\");\n\
+                      let y = perform Ask!(x);\n\
+                      y";
+        let mut rt = Runtime::new();
+        rt.grant("Ask").unwrap();
+        rt.record_to(&path).unwrap();
+        let RunOutcome::Pending(calls) = rt.eval_hosted(script).unwrap() else {
+            panic!()
+        };
+        // answer NaN; the script passes it back as the second call's arg,
+        // so the recorded args contain NaN and strict verify must not trip
+        rt.resume_with(calls[0].id, HV::Float(f64::NAN)).unwrap();
+        let RunOutcome::Pending(calls2) = rt.run_hosted_continue().unwrap() else {
+            panic!()
+        };
+        rt.resume_with(calls2[0].id, HV::Int(1)).unwrap();
+        rt.run_hosted_continue().unwrap();
+        drop(rt);
+
+        let (_rt, outcome) = Runtime::resume_from_log(&path).unwrap();
+        assert!(matches!(outcome, RunOutcome::Done(_)));
+    }
 }
