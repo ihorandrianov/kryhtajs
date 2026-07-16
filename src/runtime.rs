@@ -558,13 +558,25 @@ impl Runtime {
                     self.current = None;
                 }
                 Ok(Outcome::Suspended { effect, args }) => {
-                    match self.handle_effect(effect, args, ast)? {
-                        EffectResult::Resume => {}
-                        EffectResult::Block => {
+                    match self.handle_effect(effect, args, ast) {
+                        Ok(EffectResult::Resume) => {}
+                        Ok(EffectResult::Block) => {
                             self.current = None;
                         }
-                        EffectResult::Spawned(id) => {
+                        Ok(EffectResult::Spawned(id)) => {
                             self.interpreter.control = Control::Value(JSValue::Int(id.0 as i32));
+                        }
+                        Err(err) => {
+                            // Contain like the interpreter-error arm below:
+                            // the root fiber's failure is the program's
+                            // failure; a child fiber's effect-handler failure
+                            // (e.g. a carve fork with insufficient fuel) is
+                            // contained and surfaces at whoever joins it.
+                            if self.current == Some(FiberId(0)) {
+                                return Err(err);
+                            }
+                            self.fail_current_fiber(err);
+                            self.current = None;
                         }
                     }
                 }
@@ -1476,5 +1488,66 @@ mod fuel_fork_tests {
             .eval("perform Fork!(() => 1, { fuel: \"lots\" });")
             .unwrap_err();
         assert!(err.to_string().contains("fuel"), "{err}");
+    }
+
+    #[test]
+    fn carved_child_forking_beyond_its_fuel_is_contained_at_join() {
+        use crate::host::{to_host_value, HostValue};
+        let mut rt = Runtime::new();
+        rt.set_fuel(Some(1_000_000)).unwrap();
+        // The child holds a 2,000-step carve. Inside it, a fork asking for
+        // 100,000 exceeds the child's own meter, so the carve fails inside
+        // an effect handler. That failure must be CONTAINED (not kill the
+        // run): the root joins the child, sees {err} with "insufficient
+        // fuel", then runs past the join to return a value that proves it
+        // survived. Before the fix, this handle_effect error propagated out
+        // of the scheduler and killed the whole run.
+        let v = rt
+            .eval(
+                "let child = perform Fork!(() => {\n\
+                     perform Fork!(() => 1, { fuel: 100000 });\n\
+                     1;\n\
+                 }, { fuel: 2000 });\n\
+                 let r = perform Join!(child);\n\
+                 let survived = 40 + 2;\n\
+                 let out = { reason: r.err, survived: survived };\n\
+                 out;",
+            )
+            .unwrap();
+        let HostValue::Object(fields) = to_host_value(&rt.interpreter, v).unwrap() else {
+            panic!("expected object result");
+        };
+        let reason = fields.iter().find(|(k, _)| k == "reason").map(|(_, x)| x);
+        let survived = fields.iter().find(|(k, _)| k == "survived").map(|(_, x)| x);
+        assert!(
+            matches!(reason, Some(HostValue::Str(s)) if s.contains("insufficient fuel")),
+            "join did not surface the child's insufficient-fuel failure: {reason:?}"
+        );
+        assert_eq!(
+            survived,
+            Some(&HostValue::Int(42)),
+            "root did not run past the join"
+        );
+    }
+
+    #[test]
+    fn zero_fuel_carve_fails_the_child_at_out_of_fuel() {
+        let mut rt = Runtime::new();
+        rt.set_fuel(Some(1_000_000)).unwrap();
+        // Zero-budget carve corner: the carve succeeds (0 <= remaining) and
+        // the child gets a meter with remaining 0, so at its very first
+        // selection the scheduler fails it with out_of_fuel. The parent's
+        // join sees {err}; the run is unaffected.
+        let v = rt
+            .eval(
+                "let f = perform Fork!(() => 1, { fuel: 0 });\n\
+                 let r = perform Join!(f);\n\
+                 r.err;",
+            )
+            .unwrap();
+        let JSValue::String(s) = v else {
+            panic!("expected err string, got {v:?}");
+        };
+        assert!(rt.interpreter.strings.get(s).unwrap().contains("out_of_fuel"));
     }
 }
