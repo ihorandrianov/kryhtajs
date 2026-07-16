@@ -13,6 +13,7 @@ use crate::cekh::{CEKH, Control};
 use crate::cont::{ContArena, Kont};
 use crate::env::{Env, EnvArena, EnvId};
 use crate::error::{JSError, Result};
+use crate::fuel::Meters;
 use crate::gc::GC;
 use crate::handler::{Handler, HandlerArena};
 use crate::host::HostValue;
@@ -629,6 +630,10 @@ fn read_fiber(r: &mut ByteReader) -> Result<Fiber> {
         cont,
         env,
         status,
+        // Fuel meters aren't part of the wire format yet; every restored
+        // fiber comes back on the root meter until snapshot support for
+        // per-fiber meters lands.
+        meter: Meters::ROOT,
     })
 }
 
@@ -2215,6 +2220,11 @@ pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
         effects,
         // A restored runtime never inherits log mode — LogMode is runtime-local.
         log: crate::replay::LogMode::Off,
+        // Fuel meters aren't part of the wire format yet; restored runs
+        // come back with a fresh, unlimited meter arena.
+        meters: Meters::new(),
+        quantum: crate::fuel::DEFAULT_QUANTUM,
+        steps_total: 0,
     })
 }
 
@@ -2513,6 +2523,7 @@ mod tests {
                 effect: StrId(6),
                 args: vec![JSValue::Bool(false)],
             },
+            meter: Meters::ROOT,
         };
         let mut w = ByteWriter::new();
         write_fiber(&mut w, &fiber);

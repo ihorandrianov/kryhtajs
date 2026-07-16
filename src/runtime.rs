@@ -6,6 +6,7 @@ use crate::cekh::{CEKH, Control};
 use crate::cont::ContId;
 use crate::env::EnvId;
 use crate::error::{JSError, Result};
+use crate::fuel::{MeterId, Meters};
 use crate::gc::GC;
 use crate::host::{CallId, HostValue, PendingCall, RunOutcome};
 use crate::object::{Object, ObjectKind};
@@ -53,6 +54,8 @@ pub struct Fiber {
     pub env: EnvId,
 
     pub status: FiberStatus,
+
+    pub meter: MeterId,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +91,11 @@ pub struct Runtime {
     pub effects: HashMap<StrId, EffectKind>,
     /// Replay-log state. Off by default; see src/replay.rs.
     pub(crate) log: LogMode,
+    pub(crate) meters: Meters,
+    /// Slice quantum: max steps per scheduler slice. Always on.
+    pub(crate) quantum: u64,
+    /// Execution index: total steps across the whole run. Deterministic.
+    pub(crate) steps_total: u64,
 }
 
 impl Runtime {
@@ -120,6 +128,9 @@ impl Runtime {
             ast: AstArena::new(),
             effects,
             log: LogMode::Off,
+            meters: Meters::new(),
+            quantum: crate::fuel::DEFAULT_QUANTUM,
+            steps_total: 0,
         }
     }
 
@@ -213,12 +224,21 @@ impl Runtime {
         self.join_waiters.clear();
         self.current = None;
 
+        // Reset the meter arena and step index for this run, but preserve
+        // whatever root budget was configured — a fresh run should not
+        // silently regain unlimited fuel just because it's a new run.
+        let root_budget = self.meters.remaining(Meters::ROOT);
+        self.meters = Meters::new();
+        self.meters.set_root_budget(root_budget);
+        self.steps_total = 0;
+
         let root_fiber = Fiber {
             id: FiberId(0),
             control: self.interpreter.control.clone(),
             cont: self.interpreter.cont,
             env: self.interpreter.env,
             status: FiberStatus::Ready,
+            meter: Meters::ROOT,
         };
 
         self.fibers.push(root_fiber);
@@ -416,7 +436,20 @@ impl Runtime {
                 }
             }
 
-            match self.run_current_fiber(ast) {
+            let meter_id = self.current_fiber_meter();
+            let allowance = match self.meters.remaining(meter_id) {
+                None => self.quantum,
+                Some(rem) => self.quantum.min(rem),
+            };
+            // Exhausted-meter handling lands in Task 4/5; with allowance 0
+            // the interpreter preempts immediately and the fiber rotates.
+
+            let result = self.run_current_fiber(ast, allowance);
+            let spent = self.interpreter.steps_spent;
+            self.meters.charge(meter_id, spent);
+            self.steps_total += spent;
+
+            match result {
                 Ok(Outcome::Done(value)) => {
                     if self.current == Some(FiberId(0)) {
                         main_result = value;
@@ -435,9 +468,19 @@ impl Runtime {
                         }
                     }
                 }
-                // Task 3 replaces the u64::MAX allowance above with a real
-                // one and handles this arm for real.
-                Ok(Outcome::Preempted) => unreachable!("unlimited allowance never preempts"),
+                Ok(Outcome::Preempted) => {
+                    self.save_current_fiber_state();
+                    let id = self.current.take().expect("preempted without current");
+                    self.ready_queue.push_back(id);
+                    // The new GC opportunity: fiber state is fully saved,
+                    // no loose values in flight (unlike the Suspended arm,
+                    // whose taken args are not GC roots — that check stays
+                    // in handle_effect untouched).
+                    if self.gc.should_collect(&self.interpreter) {
+                        self.gc
+                            .collect(&mut self.interpreter, &self.fibers, &self.effects);
+                    }
+                }
                 Err(err) => {
                     // The root fiber's failure is the program's failure;
                     // a child fiber's failure is contained and surfaces
@@ -473,10 +516,18 @@ impl Runtime {
         Some(fiber_id)
     }
 
-    fn run_current_fiber(&mut self, ast: &AstArena) -> Result<Outcome> {
+    fn run_current_fiber(&mut self, ast: &AstArena, allowance: u64) -> Result<Outcome> {
         assert!(self.current.is_some(), "No current fiber to run");
-        // TODO(task 3): replace with a real per-slice allowance from fuel meters.
-        self.interpreter.run(ast, u64::MAX)
+        self.interpreter.run(ast, allowance)
+    }
+
+    fn current_fiber_meter(&self) -> MeterId {
+        let id = self.current.expect("No current fiber");
+        self.fibers
+            .iter()
+            .find(|f| f.id == id)
+            .expect("Current fiber not found")
+            .meter
     }
 
     fn complete_current_fiber(&mut self, value: JSValue) {
@@ -507,7 +558,13 @@ impl Runtime {
         }
     }
 
-    fn spawn_fiber(&mut self, cont: ContId, env: EnvId, control: Control) -> FiberId {
+    fn spawn_fiber(
+        &mut self,
+        cont: ContId,
+        env: EnvId,
+        control: Control,
+        meter: MeterId,
+    ) -> FiberId {
         let id = self.get_next_fiber_id();
 
         let fiber = Fiber {
@@ -516,6 +573,7 @@ impl Runtime {
             cont,
             env,
             status: FiberStatus::Ready,
+            meter,
         };
 
         self.fibers.push(fiber);
@@ -615,7 +673,8 @@ impl Runtime {
         let cont = self.interpreter.conts.alloc(Kont::Halt);
         let env = func_data.env;
 
-        let id = self.spawn_fiber(cont, env, control);
+        let parent_meter = self.current_fiber_meter();
+        let id = self.spawn_fiber(cont, env, control, parent_meter);
         Ok(EffectResult::Spawned(id))
     }
 
@@ -1070,5 +1129,48 @@ mod host_effect_tests {
             panic!("expected Done");
         };
         assert_eq!(v, JSValue::Int(0));
+    }
+}
+
+#[cfg(test)]
+mod fuel_scheduler_tests {
+    use super::*;
+
+    // NOTE: the user-visible fairness win (a spinner no longer starves
+    // its siblings) is only observable once a run can END despite the
+    // spinner — that needs the root budget, so it's tested in Task 4/5
+    // (fuel_fork_tests::fork_without_options_shares_the_parent_meter).
+    // Here we test the mechanics the quantum adds: charging and GC.
+
+    #[test]
+    fn steps_total_accumulates_across_slices() {
+        let mut rt = Runtime::new();
+        rt.eval("let x = 0; while (x < 100) { x = x + 1; }").unwrap();
+        assert!(rt.steps_total > 100);
+    }
+
+    #[test]
+    fn steps_total_is_deterministic() {
+        let mut a = Runtime::new();
+        let mut b = Runtime::new();
+        a.eval("let x = 0; while (x < 100) { x = x + 1; }").unwrap();
+        b.eval("let x = 0; while (x < 100) { x = x + 1; }").unwrap();
+        assert_eq!(a.steps_total, b.steps_total);
+    }
+
+    #[test]
+    fn effect_free_loop_no_longer_starves_gc() {
+        // Allocates in a loop that performs no effects. Before this task,
+        // GC only ran inside handle_effect, so collections stayed at 0.
+        let mut rt = Runtime::new();
+        rt.eval(
+            "let i = 0;\n\
+             while (i < 20000) { let o = { a: 1 }; i = i + 1; }",
+        )
+        .unwrap();
+        assert!(
+            rt.gc_stats().collections > 0,
+            "GC never ran during an effect-free allocating loop"
+        );
     }
 }
