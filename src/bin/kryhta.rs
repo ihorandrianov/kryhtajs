@@ -7,25 +7,57 @@ use kryhta::{JSError, JSValue, Result, RunOutcome, Runtime};
 use std::io::{self, BufRead, Write};
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
 
-    match args.get(1).map(String::as_str) {
-        Some("--resume") => match args.get(2) {
-            Some(path) => resume(path),
+    let mut fuel: Option<u64> = None;
+    if args.first().map(String::as_str) == Some("--fuel") {
+        if args.len() < 2 {
+            eprintln!("Error: --fuel requires a step count");
+            std::process::exit(1);
+        }
+        match args[1].parse::<u64>() {
+            Ok(n) => fuel = Some(n),
+            Err(_) => {
+                eprintln!("Error: --fuel expects an integer, got '{}'", args[1]);
+                std::process::exit(1);
+            }
+        }
+        args.drain(0..2);
+    }
+
+    match args.first().map(String::as_str) {
+        Some("--resume") => match args.get(1) {
+            Some(path) => {
+                if fuel.is_some() {
+                    eprintln!(
+                        "Error: --fuel cannot be combined with --resume; a resumed runtime is not fresh"
+                    );
+                    std::process::exit(1);
+                }
+                resume(path)
+            }
             None => {
                 eprintln!("Error: Usage: kryhta --resume <file.snap>");
                 std::process::exit(1);
             }
         },
-        Some("--record") => match (args.get(2), args.get(3)) {
-            (Some(log), Some(script)) => record(log, script),
+        Some("--record") => match (args.get(1), args.get(2)) {
+            (Some(log), Some(script)) => record(log, script, fuel),
             _ => {
                 eprintln!("Error: Usage: kryhta --record <file.klog> <script.js>");
                 std::process::exit(1);
             }
         },
-        Some("--replay") => match args.get(2) {
-            Some(path) => replay_log(path),
+        Some("--replay") => match args.get(1) {
+            Some(path) => {
+                if fuel.is_some() {
+                    eprintln!(
+                        "Error: --fuel cannot be combined with --replay; fuel config comes from the log header"
+                    );
+                    std::process::exit(1);
+                }
+                replay_log(path)
+            }
             None => {
                 eprintln!("Error: Usage: kryhta --replay <file.klog>");
                 std::process::exit(1);
@@ -34,9 +66,15 @@ fn main() -> Result<()> {
         Some(path) => {
             let source = std::fs::read_to_string(path)
                 .map_err(|_| JSError::InternalError("Failed to read file"))?;
-            run(&source)
+            run(&source, fuel)
         }
-        None => repl(),
+        None => {
+            if fuel.is_some() {
+                eprintln!("Error: --fuel is not supported in the REPL; provide a script");
+                std::process::exit(1);
+            }
+            repl()
+        }
     }
 }
 
@@ -57,22 +95,9 @@ fn resume(path: &str) -> Result<()> {
     };
 
     match runtime.run_resumed() {
-        Ok(kryhta::RunOutcome::Done(result)) => {
-            if !matches!(result, JSValue::Undefined) {
-                print_value(&result, &runtime);
-            }
+        Ok(outcome) => {
+            report_outcome(outcome, &runtime);
             Ok(())
-        }
-        Ok(kryhta::RunOutcome::Pending(calls)) => {
-            eprintln!(
-                "Error: snapshot is waiting on host effect '{}'; the CLI has no host tools — resume it from a Rust embedder",
-                calls[0].effect
-            );
-            std::process::exit(1);
-        }
-        Ok(kryhta::RunOutcome::OutOfFuel { spent }) => {
-            eprintln!("out of fuel after {spent} steps");
-            std::process::exit(1);
         }
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -81,10 +106,16 @@ fn resume(path: &str) -> Result<()> {
     }
 }
 
-fn record(log_path: &str, script_path: &str) -> Result<()> {
+fn record(log_path: &str, script_path: &str, fuel: Option<u64>) -> Result<()> {
     let source = std::fs::read_to_string(script_path)
         .map_err(|_| JSError::InternalError("Failed to read file"))?;
     let mut runtime = Runtime::new();
+    if let Some(n) = fuel {
+        if let Err(e) = runtime.set_fuel(Some(n)) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
     if let Err(e) = runtime
         .record_to(log_path)
         .and_then(|_| runtime.eval_hosted(&source))
@@ -175,14 +206,16 @@ fn eval_line(runtime: &mut Runtime, source: &str) -> Result<JSValue> {
     runtime.eval(source)
 }
 
-fn run(source: &str) -> Result<()> {
+fn run(source: &str, fuel: Option<u64>) -> Result<()> {
     let mut runtime = Runtime::new();
-    match eval_line(&mut runtime, source) {
-        Ok(result) => {
-            if !matches!(result, JSValue::Undefined) {
-                print_value(&result, &runtime);
-            }
+    if let Some(n) = fuel {
+        if let Err(e) = runtime.set_fuel(Some(n)) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
         }
+    }
+    match runtime.eval_hosted(source) {
+        Ok(outcome) => report_outcome(outcome, &runtime),
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);

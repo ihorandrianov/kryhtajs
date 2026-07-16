@@ -170,6 +170,29 @@ own event.
 
 CLI: `kryhta --record run.klog script.js`, then `kryhta --replay run.klog`.
 
+## Fuel
+
+A runtime can be given a deterministic step budget instead of an unbounded
+run: each interpreter step spends one unit, and exhausting the budget
+suspends the run rather than spinning forever — useful for a runaway script
+or an untrusted one.
+
+```bash
+kryhta --fuel 100000 script.js   # exits 1: "out of fuel after N steps"
+```
+
+`rt.set_fuel(Some(n))` works on a fresh runtime only (it's part of the run's
+identity) and applies to plain runs and `--record`; `--replay` rejects
+`--fuel` since the budget comes from the log header instead. A fork can
+carve its own sub-budget — `perform Fork!(f, { fuel: n })` — so a child
+running out doesn't touch the parent's meter; the failure surfaces as
+`{err: "out_of_fuel"}` when the parent joins it. Embedders see exhaustion as
+`RunOutcome::OutOfFuel { spent }` and can top the root meter back up with
+`rt.add_fuel(amount)` before continuing. Fuel config is frozen into recorded
+logs, so replay reproduces the same budget without being told again.
+
+CLI: `kryhta --fuel N script.js`, or `kryhta --fuel N --record run.klog script.js`.
+
 ## License
 
 MIT
