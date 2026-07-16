@@ -15,6 +15,7 @@ pub mod cekh;
 pub mod cont;
 pub mod env;
 pub mod error;
+pub mod fuel;
 pub mod gc;
 pub mod handler;
 pub mod host;
