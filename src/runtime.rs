@@ -637,6 +637,18 @@ impl Runtime {
 
     fn remove_fiber(&mut self, fiber_id: FiberId) {
         if let Some(pos) = self.fibers.iter().position(|f| f.id == fiber_id) {
+            let meter = self.fibers[pos].meter;
+            // Refund only when no other fiber (any status) still holds
+            // this meter: the last consumed holder returns the leftover.
+            // Never-joined fibers are never removed, so they forfeit —
+            // documented in the spec.
+            let shared = self
+                .fibers
+                .iter()
+                .any(|f| f.id != fiber_id && f.meter == meter);
+            if !shared {
+                self.meters.refund_into_parent(meter);
+            }
             self.fibers.swap_remove(pos);
         }
     }
@@ -757,7 +769,33 @@ impl Runtime {
         let env = func_data.env;
 
         let parent_meter = self.current_fiber_meter();
-        let id = self.spawn_fiber(cont, env, control, parent_meter);
+        let child_meter = match args.get(1).copied() {
+            None | Some(JSValue::Undefined) => parent_meter,
+            Some(JSValue::Object(oid)) => {
+                let fuel_key = self.interpreter.strings.intern("fuel");
+                let obj = self
+                    .interpreter
+                    .objects
+                    .get(oid.into_arena_id())
+                    .ok_or(JSError::InternalError("Invalid options object"))?;
+                match obj.get(fuel_key) {
+                    None | Some(JSValue::Undefined) => parent_meter,
+                    Some(JSValue::Int(n)) if n >= 0 => {
+                        self.meters.carve(parent_meter, n as u64)?
+                    }
+                    Some(_) => {
+                        return Err(JSError::type_error(
+                            "Fork: fuel must be a non-negative integer",
+                        ));
+                    }
+                }
+            }
+            Some(_) => {
+                return Err(JSError::type_error("Fork: options must be an object"));
+            }
+        };
+
+        let id = self.spawn_fiber(cont, env, control, child_meter);
         Ok(EffectResult::Spawned(id))
     }
 
@@ -1318,5 +1356,81 @@ mod fuel_scheduler_tests {
             rt.gc_stats().collections > 0,
             "GC never ran during an effect-free allocating loop"
         );
+    }
+}
+
+#[cfg(test)]
+mod fuel_fork_tests {
+    use super::*;
+    use crate::value::JSValue;
+
+    #[test]
+    fn carved_child_that_spins_fails_with_out_of_fuel_at_join() {
+        let mut rt = Runtime::new();
+        rt.set_fuel(Some(1_000_000)).unwrap();
+        let v = rt
+            .eval(
+                "let f = perform Fork!(() => { while (true) { let x = 1; } }, { fuel: 2000 });\n\
+                 let r = perform Join!(f);\n\
+                 r.err;",
+            )
+            .unwrap();
+        let JSValue::String(s) = v else {
+            panic!("expected err string, got {v:?}");
+        };
+        assert!(rt.interpreter.strings.get(s).unwrap().contains("out_of_fuel"));
+    }
+
+    #[test]
+    fn unspent_carved_fuel_is_refunded_at_join() {
+        let mut rt = Runtime::new();
+        rt.set_fuel(Some(100_000)).unwrap();
+        rt.eval(
+            "let f = perform Fork!(() => 42, { fuel: 50000 });\n\
+             perform Join!(f);",
+        )
+        .unwrap();
+        // The child spent a handful of steps of its 50k carve; nearly all
+        // of it must be back in the root meter. Exact figure varies with
+        // interpreter details; the invariant is "most of it returned".
+        let rem = rt.meters.remaining(crate::fuel::Meters::ROOT).unwrap();
+        assert!(rem > 90_000, "leftover not refunded: root has {rem}");
+    }
+
+    #[test]
+    fn fork_without_options_shares_the_parent_meter() {
+        let mut rt = Runtime::new();
+        rt.set_fuel(Some(5_000)).unwrap();
+        // Shared meter: the forked spinner drains the ROOT budget, so the
+        // whole run pauses rather than the child failing alone.
+        let outcome = rt
+            .eval_hosted(
+                "let f = perform Fork!(() => { while (true) { let x = 1; } });\n\
+                 perform Join!(f);",
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::host::RunOutcome::OutOfFuel { .. }
+        ));
+    }
+
+    #[test]
+    fn fork_with_insufficient_fuel_fails_the_forking_fiber() {
+        let mut rt = Runtime::new();
+        rt.set_fuel(Some(100)).unwrap();
+        let err = rt
+            .eval("let f = perform Fork!(() => 1, { fuel: 5000 }); 1;")
+            .unwrap_err();
+        assert!(err.to_string().contains("insufficient fuel"), "{err}");
+    }
+
+    #[test]
+    fn fork_with_non_integer_fuel_is_a_type_error() {
+        let mut rt = Runtime::new();
+        let err = rt
+            .eval("perform Fork!(() => 1, { fuel: \"lots\" });")
+            .unwrap_err();
+        assert!(err.to_string().contains("fuel"), "{err}");
     }
 }
