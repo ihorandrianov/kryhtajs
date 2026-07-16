@@ -616,6 +616,7 @@ fn write_fiber(w: &mut ByteWriter, f: &Fiber) {
     w.u32(f.cont.index() as u32);
     w.u32(f.env.index() as u32);
     write_fiber_status(w, &f.status);
+    w.u32(f.meter.0);
 }
 
 fn read_fiber(r: &mut ByteReader) -> Result<Fiber> {
@@ -624,16 +625,14 @@ fn read_fiber(r: &mut ByteReader) -> Result<Fiber> {
     let cont = ContId::new(r.u32()?);
     let env = EnvId::new(r.u32()?);
     let status = read_fiber_status(r)?;
+    let meter = crate::fuel::MeterId(r.u32()?);
     Ok(Fiber {
         id,
         control,
         cont,
         env,
         status,
-        // Fuel meters aren't part of the wire format yet; every restored
-        // fiber comes back on the root meter until snapshot support for
-        // per-fiber meters lands.
-        meter: Meters::ROOT,
+        meter,
     })
 }
 
@@ -1983,7 +1982,7 @@ fn read_ast(r: &mut ByteReader) -> Result<AstArena> {
 }
 
 pub const MAGIC: &[u8; 4] = b"KRHT";
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 fn write_arena<T>(w: &mut ByteWriter, arena: &Arena<T>, write_elem: fn(&mut ByteWriter, &T)) {
     let slots = arena.slots();
@@ -2098,6 +2097,27 @@ pub fn write_runtime(rt: &Runtime, ready_override: &VecDeque<FiberId>) -> Vec<u8
         });
     }
 
+    let meters = rt.meters.slots();
+    w.u32(meters.len() as u32);
+    for m in meters {
+        match m.remaining {
+            Some(v) => {
+                w.bool_(true);
+                w.u64(v);
+            }
+            None => w.bool_(false),
+        }
+        match m.parent {
+            Some(p) => {
+                w.bool_(true);
+                w.u32(p.0);
+            }
+            None => w.bool_(false),
+        }
+    }
+    w.u64(rt.steps_total);
+    w.u64(rt.quantum);
+
     w.finish()
 }
 
@@ -2191,6 +2211,46 @@ pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
         effects.insert(name, kind);
     }
 
+    let n = r.u32()? as usize;
+    let mut meter_slots = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        let remaining = if r.bool_()? { Some(r.u64()?) } else { None };
+        let parent = if r.bool_()? {
+            Some(crate::fuel::MeterId(r.u32()?))
+        } else {
+            None
+        };
+        meter_slots.push(crate::fuel::Meter { remaining, parent });
+    }
+    if meter_slots.is_empty() {
+        return Err(JSError::Message(
+            "snapshot: meters missing root at slot 0".to_string(),
+        ));
+    }
+    for m in &meter_slots {
+        if let Some(p) = m.parent {
+            if p.0 as usize >= meter_slots.len() {
+                return Err(JSError::Message(
+                    "snapshot: meter parent id out of range".to_string(),
+                ));
+            }
+        }
+    }
+    for f in &fibers {
+        if f.meter.0 as usize >= meter_slots.len() {
+            return Err(JSError::Message(
+                "snapshot: fiber meter id out of range".to_string(),
+            ));
+        }
+    }
+    let steps_total = r.u64()?;
+    let quantum = r.u64()?;
+    if quantum == 0 {
+        return Err(JSError::Message(
+            "snapshot: quantum must be at least 1".to_string(),
+        ));
+    }
+
     let interpreter = CEKH {
         control,
         env,
@@ -2220,11 +2280,9 @@ pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
         effects,
         // A restored runtime never inherits log mode — LogMode is runtime-local.
         log: crate::replay::LogMode::Off,
-        // Fuel meters aren't part of the wire format yet; restored runs
-        // come back with a fresh, unlimited meter arena.
-        meters: Meters::new(),
-        quantum: crate::fuel::DEFAULT_QUANTUM,
-        steps_total: 0,
+        meters: Meters::from_slots(meter_slots),
+        quantum,
+        steps_total,
     })
 }
 
@@ -3221,5 +3279,27 @@ mod tests {
         let bytes = w.finish();
         let mut r = ByteReader::new(&bytes);
         assert_eq!(read_host_value(&mut r).unwrap(), v);
+    }
+
+    #[test]
+    fn fuel_state_survives_a_snapshot_roundtrip() {
+        use crate::host::RunOutcome;
+        let mut rt = Runtime::new();
+        rt.set_fuel(Some(300)).unwrap();
+        rt.set_quantum(64).unwrap();
+        let outcome = rt.eval_hosted("while (true) { let x = 1; }").unwrap();
+        assert!(matches!(outcome, RunOutcome::OutOfFuel { .. }));
+
+        let bytes = write_runtime(&rt, &rt.ready_queue.clone());
+        let mut rt2 = read_runtime(&bytes).unwrap();
+
+        assert_eq!(rt2.quantum, 64);
+        assert_eq!(rt2.steps_total, rt.steps_total);
+        assert_eq!(rt2.meters.remaining(crate::fuel::Meters::ROOT), Some(0));
+        // The restored, refueled runtime pauses again — proof the budget
+        // machinery survived the trip.
+        rt2.add_fuel(100).unwrap();
+        let outcome = rt2.run_resumed().unwrap();
+        assert!(matches!(outcome, RunOutcome::OutOfFuel { .. }));
     }
 }
