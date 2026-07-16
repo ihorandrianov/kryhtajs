@@ -59,6 +59,9 @@ pub struct Fiber {
 pub enum Outcome {
     Done(JSValue),
     Suspended { effect: StrId, args: Vec<JSValue> },
+    /// Slice allowance exhausted mid-fiber; interpreter state is intact
+    /// and the fiber can be re-entered.
+    Preempted,
 }
 
 #[derive(Debug, Clone)]
@@ -432,6 +435,9 @@ impl Runtime {
                         }
                     }
                 }
+                // Task 3 replaces the u64::MAX allowance above with a real
+                // one and handles this arm for real.
+                Ok(Outcome::Preempted) => unreachable!("unlimited allowance never preempts"),
                 Err(err) => {
                     // The root fiber's failure is the program's failure;
                     // a child fiber's failure is contained and surfaces
@@ -469,7 +475,8 @@ impl Runtime {
 
     fn run_current_fiber(&mut self, ast: &AstArena) -> Result<Outcome> {
         assert!(self.current.is_some(), "No current fiber to run");
-        self.interpreter.run(ast)
+        // TODO(task 3): replace with a real per-slice allowance from fuel meters.
+        self.interpreter.run(ast, u64::MAX)
     }
 
     fn complete_current_fiber(&mut self, value: JSValue) {

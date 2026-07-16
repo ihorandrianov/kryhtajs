@@ -2196,6 +2196,8 @@ pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
         objects,
         strings,
         globals,
+        // Transient per-slice state; not part of the snapshot.
+        steps_spent: 0,
     };
 
     let mut gc = GC::new();

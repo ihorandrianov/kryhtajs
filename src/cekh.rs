@@ -62,6 +62,10 @@ pub struct CEKH {
 
     /// Global variables
     pub globals: HashMap<StrId, JSValue>,
+
+    /// Steps executed by the most recent `run` call. Valid after both Ok
+    /// and Err returns so the scheduler can charge fuel on every path.
+    pub steps_spent: u64,
 }
 
 impl CEKH {
@@ -82,6 +86,7 @@ impl CEKH {
             objects: Arena::new(),
             strings: StringPool::new(),
             globals: HashMap::new(),
+            steps_spent: 0,
         };
 
         machine.setup_builtins();
@@ -119,7 +124,8 @@ impl CEKH {
         Ok(JSValue::Null)
     }
 
-    pub fn run(&mut self, ast: &AstArena) -> Result<Outcome> {
+    pub fn run(&mut self, ast: &AstArena, allowance: u64) -> Result<Outcome> {
+        self.steps_spent = 0;
         loop {
             match self.control {
                 Control::Halted(val) => return Ok(Outcome::Done(val)),
@@ -128,11 +134,20 @@ impl CEKH {
                     ref mut args,
                 } => {
                     return Ok(Outcome::Suspended {
-                        effect: effect,
+                        effect,
                         args: std::mem::take(args),
                     });
                 }
-                _ => self.step(ast)?,
+                _ => {
+                    // Checked before stepping: allowance 0 preempts
+                    // immediately, and Halted/Suspend still return above
+                    // even at exactly 0 so finished work is never redone.
+                    if self.steps_spent >= allowance {
+                        return Ok(Outcome::Preempted);
+                    }
+                    self.step(ast)?;
+                    self.steps_spent += 1;
+                }
             }
         }
     }
@@ -2680,5 +2695,60 @@ impl CEKH {
 impl Default for CEKH {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod fuel_slice_tests {
+    use crate::runtime::{Outcome, Runtime};
+
+    // Drive the interpreter through Runtime plumbing to avoid re-doing
+    // parse/setup by hand; these tests call interpreter.run directly.
+    fn setup(src: &str) -> (crate::cekh::CEKH, crate::ast::AstArena) {
+        let mut rt = Runtime::new();
+        let parser = crate::parser::Parser::with_state(
+            src,
+            rt.interpreter.strings.clone(),
+            crate::ast::AstArena::new(),
+        )
+        .unwrap();
+        let (arena, strings) = parser.parse_program().unwrap();
+        rt.interpreter.strings = strings;
+        rt.interpreter.fresh_exec_setup(&arena).unwrap();
+        (rt.interpreter, arena)
+    }
+
+    #[test]
+    fn zero_allowance_preempts_without_stepping() {
+        let (mut interp, ast) = setup("let x = 1;");
+        let out = interp.run(&ast, 0).unwrap();
+        assert!(matches!(out, Outcome::Preempted));
+        assert_eq!(interp.steps_spent, 0);
+    }
+
+    #[test]
+    fn small_program_finishes_under_allowance_and_reports_spent() {
+        let (mut interp, ast) = setup("let x = 1;");
+        let out = interp.run(&ast, 1_000_000).unwrap();
+        assert!(matches!(out, Outcome::Done(_)));
+        assert!(interp.steps_spent > 0);
+        assert!(interp.steps_spent < 1_000_000);
+    }
+
+    #[test]
+    fn infinite_loop_preempts_at_exactly_allowance() {
+        let (mut interp, ast) = setup("while (true) { let x = 1; }");
+        let out = interp.run(&ast, 500).unwrap();
+        assert!(matches!(out, Outcome::Preempted));
+        assert_eq!(interp.steps_spent, 500);
+    }
+
+    #[test]
+    fn spent_is_deterministic_across_identical_runs() {
+        let (mut a, ast_a) = setup("let x = 0; while (x < 10) { x = x + 1; }");
+        let (mut b, ast_b) = setup("let x = 0; while (x < 10) { x = x + 1; }");
+        a.run(&ast_a, 1_000_000).unwrap();
+        b.run(&ast_b, 1_000_000).unwrap();
+        assert_eq!(a.steps_spent, b.steps_spent);
     }
 }
