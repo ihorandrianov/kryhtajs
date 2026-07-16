@@ -149,6 +149,70 @@ impl Runtime {
         Ok(())
     }
 
+    /// Set the root fuel budget (None = unlimited). Fresh runtimes only:
+    /// the budget is part of a run's identity, so it cannot change once
+    /// fibers exist, and it is frozen while a log is recording/replaying
+    /// (the log header is the source of truth — see Task 7).
+    pub fn set_fuel(&mut self, budget: Option<u64>) -> Result<()> {
+        if matches!(self.log, LogMode::Recording(_) | LogMode::Replaying) {
+            return Err(JSError::Message(
+                "set_fuel: fuel config is frozen while a log is recording or replaying"
+                    .to_string(),
+            ));
+        }
+        if self.next_fiber_id != 0 || !self.fibers.is_empty() {
+            return Err(JSError::Message(
+                "set_fuel: requires a fresh runtime (budget is part of the run's identity)"
+                    .to_string(),
+            ));
+        }
+        self.meters.set_root_budget(budget);
+        Ok(())
+    }
+
+    /// Set the slice quantum. Same freeze rules as set_fuel: the quantum
+    /// determines fiber interleaving, hence replay identity.
+    pub fn set_quantum(&mut self, quantum: u64) -> Result<()> {
+        if quantum == 0 {
+            return Err(JSError::Message(
+                "set_quantum: quantum must be at least 1".to_string(),
+            ));
+        }
+        if matches!(self.log, LogMode::Recording(_) | LogMode::Replaying) {
+            return Err(JSError::Message(
+                "set_quantum: fuel config is frozen while a log is recording or replaying"
+                    .to_string(),
+            ));
+        }
+        if self.next_fiber_id != 0 || !self.fibers.is_empty() {
+            return Err(JSError::Message(
+                "set_quantum: requires a fresh runtime".to_string(),
+            ));
+        }
+        self.quantum = quantum;
+        Ok(())
+    }
+
+    /// Top up the root meter after an OutOfFuel pause. Refusing any other
+    /// state keeps the API honest: fuel cannot be silently topped up
+    /// mid-run, and the check is derivable from meter state alone, so it
+    /// survives snapshot/restore. (Recording appends a Refuel event —
+    /// added in the replay task.)
+    pub fn add_fuel(&mut self, amount: u64) -> Result<()> {
+        if matches!(self.log, LogMode::Replaying) {
+            return Err(JSError::Message(
+                "add_fuel: runtime is replaying; refuels come from the log".to_string(),
+            ));
+        }
+        if self.meters.remaining(Meters::ROOT) != Some(0) {
+            return Err(JSError::Message(
+                "add_fuel: runtime is not out of fuel".to_string(),
+            ));
+        }
+        self.meters.add(Meters::ROOT, amount);
+        Ok(())
+    }
+
     /// Host-granted effect names, sorted so the log header is byte-stable
     /// regardless of HashMap iteration order.
     pub(crate) fn granted_names(&self) -> Vec<String> {
@@ -200,6 +264,9 @@ impl Runtime {
             RunOutcome::Pending(calls) => Err(JSError::Message(format!(
                 "effect '{}' suspended to the host; use run_hosted/eval_hosted",
                 calls[0].effect
+            ))),
+            RunOutcome::OutOfFuel { spent } => Err(JSError::Message(format!(
+                "run out of fuel after {spent} steps; use run_hosted/eval_hosted and add_fuel to resume"
             ))),
         }
     }
@@ -439,10 +506,26 @@ impl Runtime {
             let meter_id = self.current_fiber_meter();
             let allowance = match self.meters.remaining(meter_id) {
                 None => self.quantum,
+                Some(0) => {
+                    if meter_id == Meters::ROOT {
+                        // Pause the whole run. The fiber goes back to the
+                        // FRONT of the queue so a refueled continue picks
+                        // up exactly where the pause happened.
+                        self.save_current_fiber_state();
+                        let id = self.current.take().expect("selected fiber");
+                        self.ready_queue.push_front(id);
+                        return Ok(RunOutcome::OutOfFuel {
+                            spent: self.steps_total,
+                        });
+                    }
+                    // Carved meter ran dry: the fiber fails, contained
+                    // like any child failure; parents see {err} at Join.
+                    self.fail_current_fiber(JSError::Message("out_of_fuel".to_string()));
+                    self.current = None;
+                    continue;
+                }
                 Some(rem) => self.quantum.min(rem),
             };
-            // Exhausted-meter handling lands in Task 4/5; with allowance 0
-            // the interpreter preempts immediately and the fiber rotates.
 
             let result = self.run_current_fiber(ast, allowance);
             let spent = self.interpreter.steps_spent;
@@ -1129,6 +1212,69 @@ mod host_effect_tests {
             panic!("expected Done");
         };
         assert_eq!(v, JSValue::Int(0));
+    }
+}
+
+#[cfg(test)]
+mod fuel_budget_tests {
+    use super::*;
+    use crate::host::RunOutcome;
+
+    #[test]
+    fn root_budget_pauses_an_infinite_loop() {
+        let mut rt = Runtime::new();
+        rt.set_fuel(Some(5_000)).unwrap();
+        let outcome = rt.eval_hosted("while (true) { let x = 1; }").unwrap();
+        let RunOutcome::OutOfFuel { spent } = outcome else {
+            panic!("expected OutOfFuel, got {outcome:?}");
+        };
+        assert!(spent >= 5_000);
+    }
+
+    #[test]
+    fn refuel_and_continue_finishes_a_bounded_program() {
+        let mut rt = Runtime::new();
+        rt.set_fuel(Some(50)).unwrap();
+        let outcome = rt
+            .eval_hosted("let x = 0; while (x < 100) { x = x + 1; } x;")
+            .unwrap();
+        assert!(matches!(outcome, RunOutcome::OutOfFuel { .. }));
+        rt.add_fuel(1_000_000).unwrap();
+        let outcome = rt.run_hosted_continue().unwrap();
+        let RunOutcome::Done(v) = outcome else {
+            panic!("expected Done after refuel, got {outcome:?}");
+        };
+        assert_eq!(v, crate::value::JSValue::Int(100));
+    }
+
+    #[test]
+    fn add_fuel_requires_the_out_of_fuel_state() {
+        let mut rt = Runtime::new();
+        let err = rt.add_fuel(10).unwrap_err();
+        assert!(err.to_string().contains("not out of fuel"), "{err}");
+    }
+
+    #[test]
+    fn set_fuel_requires_a_fresh_runtime() {
+        let mut rt = Runtime::new();
+        rt.eval("1;").unwrap();
+        let err = rt.set_fuel(Some(10)).unwrap_err();
+        assert!(err.to_string().contains("fresh"), "{err}");
+    }
+
+    #[test]
+    fn set_quantum_rejects_zero() {
+        let mut rt = Runtime::new();
+        let err = rt.set_quantum(0).unwrap_err();
+        assert!(err.to_string().contains("quantum"), "{err}");
+    }
+
+    #[test]
+    fn plain_run_reports_out_of_fuel_as_error() {
+        let mut rt = Runtime::new();
+        rt.set_fuel(Some(100)).unwrap();
+        let err = rt.eval("while (true) { let x = 1; }").unwrap_err();
+        assert!(err.to_string().contains("out of fuel"), "{err}");
     }
 }
 

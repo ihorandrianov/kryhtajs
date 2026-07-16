@@ -70,6 +70,10 @@ fn resume(path: &str) -> Result<()> {
             );
             std::process::exit(1);
         }
+        Ok(kryhta::RunOutcome::OutOfFuel { spent }) => {
+            eprintln!("out of fuel after {spent} steps");
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
@@ -117,6 +121,10 @@ fn report_outcome(outcome: RunOutcome, runtime: &Runtime) {
                 "Error: run is waiting on host effect '{}'; the CLI has no host tools — answer it from a Rust embedder",
                 calls[0].effect
             );
+            std::process::exit(1);
+        }
+        RunOutcome::OutOfFuel { spent } => {
+            eprintln!("out of fuel after {spent} steps");
             std::process::exit(1);
         }
     }

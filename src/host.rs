@@ -25,6 +25,9 @@ pub struct PendingCall {
 pub enum RunOutcome {
     Done(JSValue),
     Pending(Vec<PendingCall>),
+    /// The root fuel budget ran dry. The run is paused, snapshottable,
+    /// and resumable: `add_fuel` then `run_hosted_continue`.
+    OutOfFuel { spent: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
