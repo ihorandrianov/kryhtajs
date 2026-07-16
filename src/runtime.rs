@@ -1383,16 +1383,43 @@ mod fuel_fork_tests {
 
     #[test]
     fn unspent_carved_fuel_is_refunded_at_join() {
+        use crate::host::{HostValue, RunOutcome};
         let mut rt = Runtime::new();
         rt.set_fuel(Some(100_000)).unwrap();
-        rt.eval(
-            "let f = perform Fork!(() => 42, { fuel: 50000 });\n\
-             perform Join!(f);",
-        )
-        .unwrap();
+        rt.grant("Probe").unwrap();
+
+        // A host-effect pause between the fork and the join gives us a
+        // mid-flight observation point: by the time we're blocked on
+        // Probe, the carve has already happened (proving deduction), but
+        // the join hasn't run yet, so the child's leftover fuel is still
+        // parked in the child meter, not yet folded back into root
+        // (proving the eventual refund is a distinct, later event).
+        let outcome = rt
+            .eval_hosted(
+                "let f = perform Fork!(() => 42, { fuel: 50000 });\n\
+                 perform Probe!();\n\
+                 perform Join!(f);",
+            )
+            .unwrap();
+        let RunOutcome::Pending(calls) = outcome else {
+            panic!("expected Pending on Probe");
+        };
+        // Root was charged the full 50,000 up front at carve time; the
+        // child's near-total leftover hasn't been refunded yet, so root
+        // must still be at or below the post-carve level here.
+        let mid_flight = rt.meters.remaining(crate::fuel::Meters::ROOT).unwrap();
+        assert!(
+            mid_flight <= 50_000,
+            "carve did not deduct up front: root has {mid_flight}"
+        );
+
+        rt.resume_with(calls[0].id, HostValue::Undefined).unwrap();
+        let RunOutcome::Done(_) = rt.run_hosted_continue().unwrap() else {
+            panic!("expected Done after resuming Probe and joining");
+        };
         // The child spent a handful of steps of its 50k carve; nearly all
-        // of it must be back in the root meter. Exact figure varies with
-        // interpreter details; the invariant is "most of it returned".
+        // of it must be back in the root meter now that the join has
+        // consumed the fiber and refunded its leftover.
         let rem = rt.meters.remaining(crate::fuel::Meters::ROOT).unwrap();
         assert!(rem > 90_000, "leftover not refunded: root has {rem}");
     }
