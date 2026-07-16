@@ -9,12 +9,17 @@ use crate::runtime::{FiberId, FiberStatus};
 use crate::snapshot::{read_host_value, write_host_value, ByteReader, ByteWriter};
 
 pub(crate) const LOG_MAGIC: &[u8; 4] = b"KRLG";
-pub(crate) const LOG_VERSION: u8 = 1;
+pub(crate) const LOG_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LogHeader {
     pub source: String,
     pub grants: Vec<String>,
+    /// Root fuel budget the recorded run started with; None = unlimited.
+    pub fuel: Option<u64>,
+    /// Slice quantum the recorded run used. Part of the run's identity, so
+    /// replay reconstructs the same scheduling boundaries.
+    pub quantum: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,12 +38,18 @@ pub(crate) enum LogEvent {
     /// Run completed. The result is recorded when it can cross the host
     /// boundary (plain data); a code value records as None.
     Done { result: Option<HostValue> },
+    /// One `add_fuel`: the root meter was topped up after an OutOfFuel pause.
+    /// Recording it lets replay reproduce the resume without re-consulting
+    /// the host for how much fuel it granted.
+    Refuel { amount: u64 },
 }
 
 #[derive(Debug)]
 pub(crate) struct ParsedLog {
     pub header: LogHeader,
-    pub events: Vec<LogEvent>,
+    /// Each event paired with the `steps_total` execution-index stamp it was
+    /// recorded at; replay verifies the stamp before applying the event.
+    pub events: Vec<(u64, LogEvent)>,
     /// Byte offset of the end of the last complete record — where appending
     /// resumes, dropping any torn tail a crash left behind.
     pub good_len: u64,
@@ -55,11 +66,20 @@ pub(crate) fn encode_header(h: &LogHeader) -> Vec<u8> {
     for g in &h.grants {
         w.str_(g);
     }
+    match h.fuel {
+        Some(v) => {
+            w.bool_(true);
+            w.u64(v);
+        }
+        None => w.bool_(false),
+    }
+    w.u64(h.quantum);
     w.finish()
 }
 
-pub(crate) fn encode_event(e: &LogEvent) -> Vec<u8> {
+pub(crate) fn encode_event(e: &LogEvent, steps: u64) -> Vec<u8> {
     let mut w = ByteWriter::new();
+    w.u64(steps);
     match e {
         LogEvent::HostAnswer {
             call_id,
@@ -87,6 +107,10 @@ pub(crate) fn encode_event(e: &LogEvent) -> Vec<u8> {
                 None => w.bool_(false),
             }
         }
+        LogEvent::Refuel { amount } => {
+            w.u8(4);
+            w.u64(*amount);
+        }
     }
     let payload = w.finish();
     let mut out = Vec::with_capacity(payload.len() + 4);
@@ -95,8 +119,9 @@ pub(crate) fn encode_event(e: &LogEvent) -> Vec<u8> {
     out
 }
 
-fn decode_event(payload: &[u8]) -> Result<LogEvent> {
+fn decode_event(payload: &[u8]) -> Result<(u64, LogEvent)> {
     let mut r = ByteReader::new(payload);
+    let steps = r.u64()?;
     let event = match r.u8()? {
         1 => {
             let call_id = r.u32()?;
@@ -123,6 +148,7 @@ fn decode_event(payload: &[u8]) -> Result<LogEvent> {
             };
             LogEvent::Done { result }
         }
+        4 => LogEvent::Refuel { amount: r.u64()? },
         tag => {
             return Err(JSError::Message(format!(
                 "replay log: bad event tag {tag}"
@@ -134,7 +160,7 @@ fn decode_event(payload: &[u8]) -> Result<LogEvent> {
             "replay log: trailing bytes inside an event record".to_string(),
         ));
     }
-    Ok(event)
+    Ok((steps, event))
 }
 
 pub(crate) fn parse_log(bytes: &[u8]) -> Result<ParsedLog> {
@@ -160,7 +186,19 @@ pub(crate) fn parse_log(bytes: &[u8]) -> Result<ParsedLog> {
     for _ in 0..n {
         grants.push(r.str_()?);
     }
-    let header = LogHeader { source, grants };
+    let fuel = if r.bool_()? { Some(r.u64()?) } else { None };
+    let quantum = r.u64()?;
+    if quantum == 0 {
+        return Err(JSError::Message(
+            "replay log: quantum must be at least 1".to_string(),
+        ));
+    }
+    let header = LogHeader {
+        source,
+        grants,
+        fuel,
+        quantum,
+    };
 
     // Events are length-prefixed so a crash mid-append (torn tail) is
     // distinguishable from corruption: incomplete trailing bytes end the
@@ -176,13 +214,13 @@ pub(crate) fn parse_log(bytes: &[u8]) -> Result<ParsedLog> {
         if rem.len() - 4 < len {
             break;
         }
-        let event = decode_event(&rem[4..4 + len])?;
-        if matches!(events.last(), Some(LogEvent::Done { .. })) {
+        let (stamp, event) = decode_event(&rem[4..4 + len])?;
+        if matches!(events.last(), Some((_, LogEvent::Done { .. }))) {
             return Err(JSError::Message(
                 "replay log: events after Done".to_string(),
             ));
         }
-        events.push(event);
+        events.push((stamp, event));
         off += 4 + len;
     }
     Ok(ParsedLog {
@@ -262,10 +300,10 @@ impl LogWriter {
 
     /// Write-ahead: synced to disk before the caller applies the event to
     /// the runtime, so the log never lags the state it explains.
-    pub(crate) fn append(&mut self, event: &LogEvent) -> Result<()> {
+    pub(crate) fn append(&mut self, event: &LogEvent, steps: u64) -> Result<()> {
         use std::io::Write;
         self.file
-            .write_all(&encode_event(event))
+            .write_all(&encode_event(event, steps))
             .map_err(|e| io_err("cannot append", e))?;
         self.file.sync_data().map_err(|e| io_err("cannot sync", e))
     }
@@ -321,6 +359,10 @@ impl Runtime {
         for name in &header.grants {
             rt.grant(name)?;
         }
+        // Apply the recorded fuel config while the runtime is still fresh —
+        // the freeze guards reject these once the log mode flips to Replaying.
+        rt.set_fuel(header.fuel)?;
+        rt.set_quantum(header.quantum)?;
         rt.log = LogMode::Replaying;
 
         // Mirror eval_hosted's parse-then-run, minus its mode guards.
@@ -339,7 +381,13 @@ impl Runtime {
 
         let mut unflushed_answers = false;
         let mut saw_done = false;
-        for (i, event) in events.iter().enumerate() {
+        for (i, (stamp, event)) in events.iter().enumerate() {
+            if rt.steps_total != *stamp {
+                return Err(JSError::Message(format!(
+                    "replay diverged at event {i}: execution index mismatch (log {stamp}, live {})",
+                    rt.steps_total
+                )));
+            }
             match event {
                 LogEvent::HostAnswer {
                     call_id,
@@ -375,6 +423,11 @@ impl Runtime {
                         }
                     }
                     saw_done = true;
+                }
+                LogEvent::Refuel { amount } => {
+                    // Apply directly: the public add_fuel rejects Replaying
+                    // mode (refuels come from the log, not the host).
+                    rt.meters.add(crate::fuel::Meters::ROOT, *amount);
                 }
             }
         }
@@ -458,10 +511,12 @@ mod tests {
         let header = LogHeader {
             source: "perform Ask!(\"q\")".to_string(),
             grants: vec!["Ask".to_string()],
+            fuel: None,
+            quantum: crate::fuel::DEFAULT_QUANTUM,
         };
         let mut bytes = encode_header(&header);
         for e in events {
-            bytes.extend_from_slice(&encode_event(e));
+            bytes.extend_from_slice(&encode_event(e, 0));
         }
         bytes
     }
@@ -480,10 +535,10 @@ mod tests {
         assert_eq!(parsed.header.source, "perform Ask!(\"q\")");
         assert_eq!(parsed.header.grants, vec!["Ask".to_string()]);
         assert_eq!(parsed.events.len(), 3);
-        assert!(matches!(parsed.events[1], LogEvent::Continue));
+        assert!(matches!(parsed.events[1], (_, LogEvent::Continue)));
         assert_eq!(parsed.good_len, bytes.len() as u64);
         // NaN survives: bit-exact, not PartialEq
-        let LogEvent::HostAnswer { args, .. } = &parsed.events[0] else {
+        let (_, LogEvent::HostAnswer { args, .. }) = &parsed.events[0] else {
             panic!("expected HostAnswer");
         };
         let HostValue::Array(items) = &args[1] else {
@@ -499,7 +554,10 @@ mod tests {
     fn done_without_result_round_trips() {
         let bytes = sample_log(&[LogEvent::Done { result: None }]);
         let parsed = parse_log(&bytes).unwrap();
-        assert!(matches!(parsed.events[0], LogEvent::Done { result: None }));
+        assert!(matches!(
+            parsed.events[0],
+            (_, LogEvent::Done { result: None })
+        ));
     }
 
     #[test]
@@ -516,8 +574,11 @@ mod tests {
     #[test]
     fn bad_event_tag_is_corruption() {
         let mut bytes = sample_log(&[]);
-        bytes.extend_from_slice(&1u32.to_le_bytes()); // len 1
-        bytes.push(99); // bogus tag
+        // payload = 8-byte stamp + bogus tag byte
+        let mut payload = 0u64.to_le_bytes().to_vec();
+        payload.push(99);
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payload);
         let err = parse_log(&bytes).unwrap_err();
         assert!(err.to_string().contains("tag"), "{err}");
     }
@@ -661,20 +722,21 @@ mod tests {
         let kinds: Vec<u8> = parsed
             .events
             .iter()
-            .map(|e| match e {
+            .map(|(_, e)| match e {
                 LogEvent::HostAnswer { .. } => 1,
                 LogEvent::Continue => 2,
                 LogEvent::Done { .. } => 3,
+                LogEvent::Refuel { .. } => 4,
             })
             .collect();
         assert_eq!(kinds, vec![1, 2, 1, 2, 3]);
-        let LogEvent::HostAnswer { effect, args, answer, .. } = &parsed.events[0] else {
+        let (_, LogEvent::HostAnswer { effect, args, answer, .. }) = &parsed.events[0] else {
             panic!();
         };
         assert_eq!(effect, "Ask");
         assert_eq!(args, &vec![HV::Str("second".into())]);
         assert_eq!(answer, &HV::Int(2));
-        let LogEvent::Done { result } = &parsed.events[4] else {
+        let (_, LogEvent::Done { result }) = &parsed.events[4] else {
             panic!();
         };
         assert_eq!(
@@ -692,7 +754,7 @@ mod tests {
         let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
         assert!(matches!(
             parsed.events.as_slice(),
-            [LogEvent::Done { result: None }]
+            [(_, LogEvent::Done { result: None })]
         ));
     }
 
@@ -758,7 +820,7 @@ mod tests {
         let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
         assert!(matches!(
             parsed.events.last(),
-            Some(LogEvent::Done { result: Some(_) })
+            Some((_, LogEvent::Done { result: Some(_) }))
         ));
     }
 
@@ -794,7 +856,19 @@ mod tests {
         assert_eq!(v, crate::value::JSValue::Int(5));
         // the auto-continue and completion were recorded
         let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(matches!(parsed.events.last(), Some(LogEvent::Done { .. })));
+        assert!(matches!(parsed.events.last(), Some((_, LogEvent::Done { .. }))));
+    }
+
+    /// The execution-index stamp at which `perform Ask!("q")` first blocks
+    /// on the host. Forged single-event logs must carry it so the per-event
+    /// stamp check passes and the intended (args/effect/id) divergence is
+    /// what trips, not a spurious execution-index mismatch.
+    fn ask_q_block_stamp() -> u64 {
+        let mut rt = Runtime::new();
+        rt.grant("Ask").unwrap();
+        rt.record_to(&temp_path("stamp_probe.klog")).unwrap();
+        rt.eval_hosted("perform Ask!(\"q\")").unwrap();
+        rt.steps_total
     }
 
     /// A log whose single event is forged; the genuine run performs
@@ -804,9 +878,11 @@ mod tests {
         let header = LogHeader {
             source: "perform Ask!(\"q\")".to_string(),
             grants: vec!["Ask".to_string()],
+            fuel: None,
+            quantum: crate::fuel::DEFAULT_QUANTUM,
         };
         let mut bytes = encode_header(&header);
-        bytes.extend_from_slice(&encode_event(&event));
+        bytes.extend_from_slice(&encode_event(&event, ask_q_block_stamp()));
         std::fs::write(&p, &bytes).unwrap();
         p
     }
@@ -882,9 +958,15 @@ mod tests {
         // rewrite the log with a forged Done value
         let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
         let mut bytes = encode_header(&parsed.header);
-        bytes.extend_from_slice(&encode_event(&LogEvent::Done {
-            result: Some(HV::Int(999)),
-        }));
+        // Preserve the original Done's stamp so the failure is the forged
+        // result, not a stamp mismatch.
+        let (stamp, _) = parsed.events[0];
+        bytes.extend_from_slice(&encode_event(
+            &LogEvent::Done {
+                result: Some(HV::Int(999)),
+            },
+            stamp,
+        ));
         std::fs::write(&path, &bytes).unwrap();
         let Err(err) = Runtime::resume_from_log(&path) else {
             panic!("expected error");
@@ -918,7 +1000,7 @@ mod tests {
         // rewrite the log with event 0's answer forged: 7 -> 999
         let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
         let mut bytes = encode_header(&parsed.header);
-        for (i, event) in parsed.events.iter().enumerate() {
+        for (i, (stamp, event)) in parsed.events.iter().enumerate() {
             if i == 0 {
                 let LogEvent::HostAnswer {
                     call_id,
@@ -929,14 +1011,17 @@ mod tests {
                 else {
                     panic!("expected event 0 to be a HostAnswer");
                 };
-                bytes.extend_from_slice(&encode_event(&LogEvent::HostAnswer {
-                    call_id: *call_id,
-                    effect: effect.clone(),
-                    args: args.clone(),
-                    answer: HV::Int(999),
-                }));
+                bytes.extend_from_slice(&encode_event(
+                    &LogEvent::HostAnswer {
+                        call_id: *call_id,
+                        effect: effect.clone(),
+                        args: args.clone(),
+                        answer: HV::Int(999),
+                    },
+                    *stamp,
+                ));
             } else {
-                bytes.extend_from_slice(&encode_event(event));
+                bytes.extend_from_slice(&encode_event(event, *stamp));
             }
         }
         std::fs::write(&path, &bytes).unwrap();
@@ -973,7 +1058,7 @@ mod tests {
         assert_eq!(v, crate::value::JSValue::Int(5));
         // the tail was truncated and Done re-sealed: the log parses complete
         let parsed = parse_log(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(matches!(parsed.events.last(), Some(LogEvent::Done { .. })));
+        assert!(matches!(parsed.events.last(), Some((_, LogEvent::Done { .. }))));
     }
 
     #[test]
@@ -1027,5 +1112,113 @@ mod tests {
             panic!("expected the Snapshot! outcome string");
         };
         assert_eq!(rt2.interpreter.strings.get(id), Some("saved"));
+    }
+
+    #[test]
+    fn header_roundtrips_fuel_config() {
+        let h = LogHeader {
+            source: "1;".to_string(),
+            grants: vec![],
+            fuel: Some(9000),
+            quantum: 512,
+        };
+        let bytes = encode_header(&h);
+        let parsed = parse_log(&bytes).unwrap();
+        assert_eq!(parsed.header, h);
+    }
+
+    #[test]
+    fn events_carry_execution_index_stamps() {
+        let mut bytes = encode_header(&LogHeader {
+            source: "1;".to_string(),
+            grants: vec![],
+            fuel: None,
+            quantum: crate::fuel::DEFAULT_QUANTUM,
+        });
+        bytes.extend_from_slice(&encode_event(&LogEvent::Continue, 777));
+        bytes.extend_from_slice(&encode_event(&LogEvent::Refuel { amount: 5 }, 900));
+        let parsed = parse_log(&bytes).unwrap();
+        assert_eq!(parsed.events[0], (777, LogEvent::Continue));
+        assert_eq!(parsed.events[1], (900, LogEvent::Refuel { amount: 5 }));
+    }
+
+    #[test]
+    fn recorded_out_of_fuel_run_replays_through_its_refuel() {
+        let log = temp_path("refuel.klog");
+        let source = "let x = 0; while (x < 200) { x = x + 1; } x;";
+        let (spent_first, final_steps);
+        {
+            let mut rt = Runtime::new();
+            rt.set_fuel(Some(100)).unwrap();
+            rt.record_to(&log).unwrap();
+            let out = rt.eval_hosted(source).unwrap();
+            let RunOutcome::OutOfFuel { spent } = out else {
+                panic!("expected OutOfFuel");
+            };
+            spent_first = spent;
+            rt.add_fuel(1_000_000).unwrap();
+            let RunOutcome::Done(_) = rt.run_hosted_continue().unwrap() else {
+                panic!("expected Done after refuel");
+            };
+            final_steps = rt.steps_total;
+        }
+        let (rt2, outcome) = Runtime::resume_from_log(&log).unwrap();
+        assert!(matches!(outcome, RunOutcome::Done(_)));
+        assert_eq!(rt2.steps_total, final_steps);
+        assert!(spent_first >= 100);
+    }
+
+    #[test]
+    fn fuel_config_is_frozen_while_recording() {
+        let log = temp_path("frozen_fuel.klog");
+        let mut rt = Runtime::new();
+        rt.set_fuel(Some(100)).unwrap();
+        rt.record_to(&log).unwrap();
+        rt.eval_hosted("while (true) { let x = 1; }").unwrap();
+        assert!(rt.set_fuel(None).is_err());
+        assert!(rt.set_quantum(5).is_err());
+    }
+
+    #[test]
+    fn identical_runs_produce_bit_identical_logs() {
+        let (a, b) = (temp_path("det_a.klog"), temp_path("det_b.klog"));
+        let source = "let x = 0; while (x < 500) { x = x + 1; } x;";
+        for path in [&a, &b] {
+            let mut rt = Runtime::new();
+            rt.set_fuel(Some(1_000_000)).unwrap();
+            rt.record_to(path).unwrap();
+            let RunOutcome::Done(_) = rt.eval_hosted(source).unwrap() else {
+                panic!("expected Done");
+            };
+        }
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+    }
+
+    #[test]
+    fn stamp_mismatch_is_a_divergence() {
+        let path = temp_path("stamp_mismatch.klog");
+        let mut rt = Runtime::new();
+        rt.record_to(&path).unwrap();
+        rt.eval_hosted("40 + 2").unwrap();
+        drop(rt);
+        // Overwrite the u64 stamp (first 8 bytes of the event payload, right
+        // after the 4-byte length prefix) of the first event record with a
+        // wrong execution index. The length prefix stays valid, so the log
+        // still parses and the failure must come from the stamp check.
+        let bytes = std::fs::read(&path).unwrap();
+        let parsed = parse_log(&bytes).unwrap();
+        let header_len = encode_header(&parsed.header).len();
+        let stamp_off = header_len + 4; // skip the u32 length prefix
+        let mut tampered = bytes.clone();
+        tampered[stamp_off..stamp_off + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &tampered).unwrap();
+        let Err(err) = Runtime::resume_from_log(&path) else {
+            panic!("expected error");
+        };
+        assert!(
+            err.to_string().contains("execution index mismatch"),
+            "{err}"
+        );
     }
 }

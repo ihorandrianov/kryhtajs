@@ -209,6 +209,15 @@ impl Runtime {
                 "add_fuel: runtime is not out of fuel".to_string(),
             ));
         }
+        // Write-ahead like resume_with: the Refuel record hits disk before
+        // the meter is topped up, so the log never lags the runtime.
+        if matches!(self.log, LogMode::Recording(_)) {
+            let steps = self.steps_total;
+            let event = LogEvent::Refuel { amount };
+            if let LogMode::Recording(w) = &mut self.log {
+                w.append(&event, steps)?;
+            }
+        }
         self.meters.add(Meters::ROOT, amount);
         Ok(())
     }
@@ -330,9 +339,10 @@ impl Runtime {
                 "run_hosted_continue: runtime is replaying".to_string(),
             ));
         }
+        let steps = self.steps_total;
         if let LogMode::Recording(w) = &mut self.log {
             if !w.done_written {
-                w.append(&LogEvent::Continue)?;
+                w.append(&LogEvent::Continue, steps)?;
             }
         }
         self.continue_scheduler()
@@ -355,11 +365,15 @@ impl Runtime {
             return result;
         }
         let host_result = crate::host::to_host_value(&self.interpreter, *v).ok();
+        let steps = self.steps_total;
         if let LogMode::Recording(w) = &mut self.log {
             if !w.done_written {
-                w.append(&LogEvent::Done {
-                    result: host_result,
-                })?;
+                w.append(
+                    &LogEvent::Done {
+                        result: host_result,
+                    },
+                    steps,
+                )?;
                 w.done_written = true;
             }
         }
@@ -386,6 +400,8 @@ impl Runtime {
             let header = LogHeader {
                 source: source.to_string(),
                 grants: self.granted_names(),
+                fuel: self.meters.remaining(Meters::ROOT),
+                quantum: self.quantum,
             };
             self.log = LogMode::Recording(LogWriter::create(&path, &header)?);
         }
@@ -441,10 +457,11 @@ impl Runtime {
                 args,
                 answer: value.clone(),
             };
+            let steps = self.steps_total;
             if let LogMode::Recording(w) = &mut self.log {
                 // Write-ahead: if the append fails, the answer is NOT
                 // applied — the log never lags the runtime.
-                w.append(&event)?;
+                w.append(&event, steps)?;
             }
         }
         self.apply_host_answer(fiber_id, &value);
