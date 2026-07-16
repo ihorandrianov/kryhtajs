@@ -380,6 +380,7 @@ impl Runtime {
         let mut outcome = initial?;
 
         let mut unflushed_answers = false;
+        let mut unflushed_refuel = false;
         let mut saw_done = false;
         for (i, (stamp, event)) in events.iter().enumerate() {
             if rt.steps_total != *stamp {
@@ -405,6 +406,7 @@ impl Runtime {
                 LogEvent::Continue => {
                     outcome = rt.continue_scheduler()?;
                     unflushed_answers = false;
+                    unflushed_refuel = false;
                 }
                 LogEvent::Done { result } => {
                     let RunOutcome::Done(v) = &outcome else {
@@ -428,6 +430,7 @@ impl Runtime {
                     // Apply directly: the public add_fuel rejects Replaying
                     // mode (refuels come from the log, not the host).
                     rt.meters.add(crate::fuel::Meters::ROOT, *amount);
+                    unflushed_refuel = true;
                 }
             }
         }
@@ -437,8 +440,11 @@ impl Runtime {
         writer.done_written = saw_done;
         rt.log = LogMode::Recording(writer);
 
-        if unflushed_answers {
-            // The original host died between answering and continuing;
+        if unflushed_answers || unflushed_refuel {
+            // The original host died between recording its intent to resume
+            // (a host answer, or an add_fuel Refuel that topped up the root
+            // meter) and the Continue that would consume it. The recorded
+            // Refuel IS the host's intent to resume, exactly like an answer;
             // perform the continue it would have (recording it, live).
             outcome = rt.run_hosted_continue()?;
         } else {
@@ -1166,6 +1172,48 @@ mod tests {
         assert!(matches!(outcome, RunOutcome::Done(_)));
         assert_eq!(rt2.steps_total, final_steps);
         assert!(spent_first >= 100);
+    }
+
+    #[test]
+    fn refuel_without_continue_recovers_via_auto_continue() {
+        use crate::host::to_host_value;
+        let log = temp_path("refuel_crash.klog");
+        let source = "let x = 0; while (x < 200) { x = x + 1; } x;";
+        {
+            let mut rt = Runtime::new();
+            rt.set_fuel(Some(100)).unwrap();
+            rt.record_to(&log).unwrap();
+            let RunOutcome::OutOfFuel { .. } = rt.eval_hosted(source).unwrap() else {
+                panic!("expected OutOfFuel");
+            };
+            // The host records its intent to resume — the Refuel event is
+            // synced write-ahead before the meter is topped up...
+            rt.add_fuel(1_000_000).unwrap();
+            // ...then the host crashes before ever calling continue. The log
+            // now ends with a trailing Refuel and no Continue.
+            drop(rt);
+        }
+        // Recovery must honor the recorded Refuel as the resume intent and
+        // auto-continue to the run's true end, not return OutOfFuel with a
+        // meter that add_fuel would then reject.
+        let (rt2, outcome) = Runtime::resume_from_log(&log).unwrap();
+        let RunOutcome::Done(v) = outcome else {
+            panic!("expected Done after auto-continue past the trailing Refuel");
+        };
+        assert_eq!(
+            to_host_value(&rt2.interpreter, v).unwrap(),
+            HostValue::Int(200)
+        );
+        // The auto-continue was recorded live, sealing the log. A second
+        // recovery must replay that now-complete log to the same Done.
+        let (rt3, outcome2) = Runtime::resume_from_log(&log).unwrap();
+        let RunOutcome::Done(v2) = outcome2 else {
+            panic!("second recovery did not reach Done");
+        };
+        assert_eq!(
+            to_host_value(&rt3.interpreter, v2).unwrap(),
+            HostValue::Int(200)
+        );
     }
 
     #[test]
