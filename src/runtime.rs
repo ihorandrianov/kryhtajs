@@ -152,7 +152,10 @@ impl Runtime {
     /// Set the root fuel budget (None = unlimited). Fresh runtimes only:
     /// the budget is part of a run's identity, so it cannot change once
     /// fibers exist, and it is frozen while a log is recording/replaying
-    /// (the log header is the source of truth — see Task 7).
+    /// (the log header is the source of truth for the recorded config).
+    /// The budget is spent, not reset: a later run on the same runtime
+    /// starts from whatever the root meter has left, and fuel carved for
+    /// never-joined children is forfeited.
     pub fn set_fuel(&mut self, budget: Option<u64>) -> Result<()> {
         if matches!(self.log, LogMode::Recording(_) | LogMode::Replaying) {
             return Err(JSError::Message(

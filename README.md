@@ -191,7 +191,17 @@ running out doesn't touch the parent's meter; the failure surfaces as
 `rt.add_fuel(amount)` before continuing. Fuel config is frozen into recorded
 logs, so replay reproduces the same budget without being told again.
 
-CLI: `kryhta --fuel N script.js`, or `kryhta --fuel N --record run.klog script.js`.
+CLI: `kryhta --fuel N script.js`, or `kryhta --fuel N --record run.klog script.js`
+(the flag may appear in any position).
+
+Two details worth knowing. First, independent of any budget, the scheduler
+always preempts a fiber after a 10,000-step slice (`rt.set_quantum(n)` tunes
+it): that's what keeps one spinning fiber from starving its siblings and the
+GC. The quantum changes fiber interleaving, so like the budget it is frozen
+into recorded logs as part of the run's identity. Second, a budget is spent,
+not reset: a second `eval` on the same runtime runs on whatever the root
+meter has left, and fuel carved for a child that is never joined is
+forfeited rather than returned.
 
 ## License
 
