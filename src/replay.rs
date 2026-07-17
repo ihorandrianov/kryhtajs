@@ -631,6 +631,62 @@ mod tests {
     }
 
     #[test]
+    fn both_answer_orderings_record_and_replay_faithfully() {
+        // Scheduling-determinism tripwire: the host may answer concurrent
+        // calls in either order; each order is its own recorded identity
+        // and must replay bit-faithfully, landing on the same final value
+        // and the same execution index as its live run.
+        use crate::host::{HostValue, RunOutcome, to_host_value};
+        let source = "let a = perform Fork!(() => perform Ask!(\"first\"));\n\
+                      let b = perform Fork!(() => perform Ask!(\"second\"));\n\
+                      let ra = perform Join!(a);\n\
+                      let rb = perform Join!(b);\n\
+                      [ra.ok, rb.ok]";
+        let expected = HostValue::Array(vec![HostValue::Int(1), HostValue::Int(2)]);
+
+        for (label, reversed) in [("in_order", false), ("reversed", true)] {
+            let path = temp_path(&format!("orderings_{label}.klog"));
+            let mut rt = Runtime::new();
+            rt.grant("Ask").unwrap();
+            rt.record_to(&path).unwrap();
+            let RunOutcome::Pending(calls) = rt.eval_hosted(source).unwrap() else {
+                panic!("{label}: expected both fibers to pend");
+            };
+            let first = calls
+                .iter()
+                .find(|c| c.args == vec![HostValue::Str("first".into())])
+                .unwrap();
+            let second = calls
+                .iter()
+                .find(|c| c.args == vec![HostValue::Str("second".into())])
+                .unwrap();
+            if reversed {
+                rt.resume_with(second.id, HostValue::Int(2)).unwrap();
+                rt.resume_with(first.id, HostValue::Int(1)).unwrap();
+            } else {
+                rt.resume_with(first.id, HostValue::Int(1)).unwrap();
+                rt.resume_with(second.id, HostValue::Int(2)).unwrap();
+            }
+            let RunOutcome::Done(v) = rt.run_hosted_continue().unwrap() else {
+                panic!("{label}: expected Done");
+            };
+            assert_eq!(to_host_value(&rt.interpreter, v).unwrap(), expected);
+            let live_steps = rt.steps_total;
+            drop(rt);
+
+            let (rt2, outcome) = Runtime::resume_from_log(&path).unwrap();
+            let RunOutcome::Done(v2) = outcome else {
+                panic!("{label}: replay diverged, got a non-Done outcome");
+            };
+            assert_eq!(to_host_value(&rt2.interpreter, v2).unwrap(), expected);
+            assert_eq!(
+                rt2.steps_total, live_steps,
+                "{label}: replay execution index drifted from the live run"
+            );
+        }
+    }
+
+    #[test]
     fn record_to_requires_a_fresh_runtime() {
         let mut rt = Runtime::new();
         rt.eval("1 + 1").unwrap();
