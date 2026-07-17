@@ -2227,12 +2227,17 @@ pub fn read_runtime(bytes: &[u8]) -> Result<Runtime> {
             "snapshot: meters missing root at slot 0".to_string(),
         ));
     }
-    for m in &meter_slots {
+    // Carve always appends children after their parent, so a valid meter
+    // arena is topologically ordered: parent index strictly below child.
+    // Enforcing that shape rejects out-of-range ids, self-parents, cycles,
+    // and a parented root in one check.
+    for (i, m) in meter_slots.iter().enumerate() {
         if let Some(p) = m.parent {
-            if p.0 as usize >= meter_slots.len() {
-                return Err(JSError::Message(
-                    "snapshot: meter parent id out of range".to_string(),
-                ));
+            if p.0 as usize >= i {
+                return Err(JSError::Message(format!(
+                    "snapshot: meter {i} has parent {} — a parent must precede its child",
+                    p.0
+                )));
             }
         }
     }
@@ -3279,6 +3284,85 @@ mod tests {
         let bytes = w.finish();
         let mut r = ByteReader::new(&bytes);
         assert_eq!(read_host_value(&mut r).unwrap(), v);
+    }
+
+    #[test]
+    fn crafted_self_parent_meter_is_rejected() {
+        use crate::fuel::{Meter, MeterId};
+        let mut rt = Runtime::new();
+        rt.meters = Meters::from_slots(vec![
+            Meter {
+                remaining: None,
+                parent: None,
+            },
+            Meter {
+                remaining: Some(5),
+                parent: Some(MeterId(1)), // its own slot: a one-node cycle
+            },
+        ]);
+        let bytes = write_runtime(&rt, &rt.ready_queue.clone());
+        let Err(err) = read_runtime(&bytes) else {
+            panic!("crafted meter graph must be rejected");
+        };
+        assert!(err.to_string().contains("parent"), "{err}");
+    }
+
+    #[test]
+    fn crafted_root_meter_with_parent_is_rejected() {
+        use crate::fuel::{Meter, MeterId};
+        let mut rt = Runtime::new();
+        rt.meters = Meters::from_slots(vec![Meter {
+            remaining: None,
+            parent: Some(MeterId(0)),
+        }]);
+        let bytes = write_runtime(&rt, &rt.ready_queue.clone());
+        let Err(err) = read_runtime(&bytes) else {
+            panic!("crafted meter graph must be rejected");
+        };
+        assert!(err.to_string().contains("parent"), "{err}");
+    }
+
+    #[test]
+    fn crafted_out_of_range_fiber_meter_is_rejected() {
+        use crate::fuel::MeterId;
+        let mut rt = Runtime::new();
+        rt.eval_hosted("1;").unwrap();
+        rt.fibers[0].meter = MeterId(99);
+        let bytes = write_runtime(&rt, &rt.ready_queue.clone());
+        let Err(err) = read_runtime(&bytes) else {
+            panic!("out-of-range fiber meter must be rejected");
+        };
+        assert!(err.to_string().contains("fiber meter"), "{err}");
+    }
+
+    #[test]
+    fn crafted_zero_quantum_is_rejected() {
+        let mut rt = Runtime::new();
+        rt.quantum = 0;
+        let bytes = write_runtime(&rt, &rt.ready_queue.clone());
+        let Err(err) = read_runtime(&bytes) else {
+            panic!("zero quantum must be rejected");
+        };
+        assert!(err.to_string().contains("quantum"), "{err}");
+    }
+
+    #[test]
+    fn crafted_empty_meter_section_is_rejected() {
+        // A fresh runtime's snapshot ends with a fixed 22-byte tail:
+        // meters (u32 count = 1, one {None, None} meter = 2 bool bytes),
+        // then u64 steps_total and u64 quantum. Splice the meter section
+        // down to a bare zero count to hit the emptiness guard.
+        let rt = Runtime::new();
+        let bytes = write_runtime(&rt, &rt.ready_queue.clone());
+        let n = bytes.len();
+        let mut forged = Vec::with_capacity(n - 2);
+        forged.extend_from_slice(&bytes[..n - 22]);
+        forged.extend_from_slice(&0u32.to_le_bytes());
+        forged.extend_from_slice(&bytes[n - 16..]);
+        let Err(err) = read_runtime(&forged) else {
+            panic!("empty meter section must be rejected");
+        };
+        assert!(err.to_string().contains("meters missing root"), "{err}");
     }
 
     #[test]
