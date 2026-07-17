@@ -353,3 +353,85 @@ fn test_host_effect_survives_process_boundary() {
 
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn test_budgeted_subtasks_survive_recording_crash_and_recovery() {
+    use kryhta::HostValue;
+
+    let log = std::env::temp_dir()
+        .join(format!("kryhta_fuel_agent_{}.klog", std::process::id()))
+        .to_string_lossy()
+        .to_string();
+
+    // The agent-workflow story end to end: an orchestrator gives one
+    // runaway subtask a small budget and one useful subtask a bigger one.
+    // The runaway dies alone; the useful one suspends to the host.
+    let source = "let bad = perform Fork!(() => { while (true) { let x = 1; } }, { fuel: 3000 });\n\
+                  let good = perform Fork!(() => perform Llm!(\"q\"), { fuel: 20000 });\n\
+                  let rb = perform Join!(bad);\n\
+                  let rg = perform Join!(good);\n\
+                  let verdict = \"runaway was not contained\";\n\
+                  if (rb.err) { verdict = rg.ok; }\n\
+                  verdict;";
+
+    // "Process 1": record, run to the pending tool call, answer it
+    // (write-ahead), then die before continuing.
+    let mut rt = Runtime::new();
+    rt.set_fuel(Some(1_000_000)).unwrap();
+    rt.grant("Llm").unwrap();
+    rt.record_to(&log).unwrap();
+    let RunOutcome::Pending(calls) = rt.eval_hosted(source).unwrap() else {
+        panic!("expected the good subtask to suspend to the host");
+    };
+    assert_eq!(calls.len(), 1, "the runaway must die alone, not suspend");
+    assert_eq!(calls[0].effect, "Llm");
+    rt.resume_with(calls[0].id, HostValue::Str("answer42".to_string()))
+        .unwrap();
+    drop(rt); // crash: the answer is on disk, the continue never happened
+
+    // "Process 2": recover from the log alone. The trailing unflushed
+    // answer auto-continues, so recovery lands directly on Done.
+    let (rt2, outcome) = Runtime::resume_from_log(&log).unwrap();
+    let RunOutcome::Done(JSValue::String(id)) = outcome else {
+        panic!("expected recovery to finish the run, got {outcome:?}");
+    };
+    assert_eq!(
+        rt2.interpreter.strings.get(id),
+        Some("answer42"),
+        "final value must prove the runaway erred AND the answer flowed through"
+    );
+
+    std::fs::remove_file(&log).ok();
+}
+
+#[test]
+fn test_out_of_fuel_run_parks_to_disk_and_resumes_after_refuel() {
+    let path = std::env::temp_dir()
+        .join(format!("kryhta_fuel_park_{}.snap", std::process::id()))
+        .to_string_lossy()
+        .to_string();
+
+    // "Process 1": the budget runs dry mid-loop; park the whole runtime.
+    let mut rt = Runtime::new();
+    rt.set_fuel(Some(500)).unwrap();
+    let outcome = rt
+        .eval_hosted("let x = 0; while (x < 100) { x = x + 1; } x;")
+        .unwrap();
+    let RunOutcome::OutOfFuel { spent } = outcome else {
+        panic!("expected the budget to run dry, got {outcome:?}");
+    };
+    assert_eq!(spent, 500, "deterministic step accounting");
+    rt.snapshot(&path).unwrap();
+    drop(rt);
+
+    // "Process 2" (next week): restore, refuel, finish.
+    let bytes = std::fs::read(&path).unwrap();
+    let mut rt2 = Runtime::from_snapshot(&bytes).unwrap();
+    rt2.add_fuel(1_000_000).unwrap();
+    let RunOutcome::Done(v) = rt2.run_resumed().unwrap() else {
+        panic!("expected completion after the refuel");
+    };
+    assert_eq!(v, JSValue::Int(100), "the paused loop must finish correctly");
+
+    std::fs::remove_file(&path).ok();
+}
