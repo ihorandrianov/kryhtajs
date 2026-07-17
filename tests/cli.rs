@@ -94,3 +94,39 @@ fn replay_rejects_garbage_logs() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("replay log"));
 }
+
+#[test]
+fn fuel_flag_works_in_any_position() {
+    let dir = std::env::temp_dir().join("kryhta_cli_fuel");
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("bounded.js");
+    std::fs::write(&script, "let x = 0; while (x < 500) { x = x + 1; } x").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_kryhta");
+
+    // Flag AFTER the script path must still be honored.
+    let out = Command::new(bin)
+        .arg(&script)
+        .arg("--fuel")
+        .arg("100")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "trailing --fuel was ignored: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("out of fuel after"));
+
+    // Giving the flag twice is an error, not a silent override.
+    let out = Command::new(bin)
+        .arg("--fuel")
+        .arg("100")
+        .arg(&script)
+        .arg("--fuel")
+        .arg("200")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("more than once"));
+}

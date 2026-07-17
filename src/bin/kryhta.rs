@@ -10,19 +10,23 @@ fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
     let mut fuel: Option<u64> = None;
-    if args.first().map(String::as_str) == Some("--fuel") {
-        if args.len() < 2 {
+    if let Some(pos) = args.iter().position(|a| a == "--fuel") {
+        if pos + 1 >= args.len() {
             eprintln!("Error: --fuel requires a step count");
             std::process::exit(1);
         }
-        match args[1].parse::<u64>() {
+        match args[pos + 1].parse::<u64>() {
             Ok(n) => fuel = Some(n),
             Err(_) => {
-                eprintln!("Error: --fuel expects an integer, got '{}'", args[1]);
+                eprintln!("Error: --fuel expects an integer, got '{}'", args[pos + 1]);
                 std::process::exit(1);
             }
         }
-        args.drain(0..2);
+        args.drain(pos..pos + 2);
+        if args.iter().any(|a| a == "--fuel") {
+            eprintln!("Error: --fuel given more than once");
+            std::process::exit(1);
+        }
     }
 
     match args.first().map(String::as_str) {
